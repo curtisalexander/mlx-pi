@@ -493,6 +493,8 @@ def cache_size_bytes(repo: str) -> int | None:
         return None
     total = 0
     for f in blobs.iterdir():
+        if f.name.endswith(".incomplete"):  # temp files aren't part of the model
+            continue
         try:
             total += f.stat().st_size
         except OSError:
@@ -508,17 +510,41 @@ def configured_model_id() -> str | None:
     except Exception:
         return None
 
+def _active_incomplete(blobs: Path) -> bool:
+    """True if any *.incomplete temp is a genuinely in-progress download. A temp
+    is named '<sha>.<etag>.incomplete'; it's only active if its final blob
+    '<sha>' is absent. Orphaned temps from earlier attempts whose blob already
+    landed are stale leftovers and must be ignored — otherwise a fully
+    downloaded model reads as 'partial' forever (HF never cleans them up)."""
+    if not blobs.is_dir():
+        return False
+    return any(f.name.endswith(".incomplete") and not (blobs / f.name.split(".", 1)[0]).exists()
+               for f in blobs.iterdir())
+
 def model_status(repo: str) -> str:
-    """'complete', 'partial', or 'absent' for a model in the local HF cache.
-    A download in progress / interrupted leaves *.incomplete blobs behind, so
-    their presence (or a missing snapshot despite a cache dir) means partial."""
+    """'complete', 'partial', or 'absent' for a model in the local HF cache."""
     base = HF_CACHE / f"models--{repo.replace('/', '--')}"
     if not base.is_dir():
         return "absent"
-    blobs = base / "blobs"
-    if blobs.is_dir() and any(f.name.endswith(".incomplete") for f in blobs.iterdir()):
+    if _active_incomplete(base / "blobs"):
         return "partial"
     return "complete" if model_is_cached(repo) else "partial"
+
+def prune_stale_incomplete(repo: str) -> int:
+    """Delete orphaned *.incomplete temps (final blob already present) and return
+    bytes freed. Never removes an active download (final blob still missing)."""
+    blobs = HF_CACHE / f"models--{repo.replace('/', '--')}" / "blobs"
+    if not blobs.is_dir():
+        return 0
+    freed = 0
+    for f in blobs.iterdir():
+        if f.name.endswith(".incomplete") and (blobs / f.name.split(".", 1)[0]).exists():
+            try:
+                freed += f.stat().st_size
+                f.unlink()
+            except OSError:
+                pass
+    return freed
 
 def _present_repo_ids() -> list[str]:
     """Every MLX model with a cache dir (complete OR partial), as repo ids."""
@@ -592,11 +618,19 @@ def _hf_download(repo: str) -> None:
          "import sys; from huggingface_hub import snapshot_download; "
          "snapshot_download(sys.argv[1])", repo])
 
+def _pull_done(model: str, verb: str) -> None:
+    """Report a finished pull, pruning stale temp files and noting freed space."""
+    freed = prune_stale_incomplete(model)
+    msg = f"{verb}: {model}  ({_gb(cache_size_bytes(model))})"
+    if freed:
+        msg += f"  ·  cleaned up {_gb(freed)} of leftover temp files"
+    ok(msg)
+
 def cmd_models_pull(args) -> None:
     model = resolve_model(args)
     status = model_status(model)
     if status == "complete":
-        ok(f"Already downloaded: {model}  ({_gb(cache_size_bytes(model))})")
+        _pull_done(model, "Already downloaded")
         return
     if status == "partial":
         info(f"Resuming partial download: {model}  ({_gb(cache_size_bytes(model))} so far)")
@@ -605,7 +639,7 @@ def cmd_models_pull(args) -> None:
         return
     _hf_download(model)
     if model_status(model) == "complete":
-        ok(f"Downloaded: {model}  ({_gb(cache_size_bytes(model))})")
+        _pull_done(model, "Downloaded")
     else:
         warn("Download ended but the model still looks incomplete — "
              "re-run 'mlx-pi models pull' to retry.")
