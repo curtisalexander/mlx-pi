@@ -116,7 +116,7 @@ set -Ux HF_TOKEN hf_xxxxx       # fish (universal, persists)
 
 `models pull`, `up`, and `pi` all run their downloads as child processes that inherit your environment, so `HF_TOKEN` is picked up automatically — no flag needed. (A token saved via `hf auth login` works too.)
 
-> ⚠️ The **launchd** auto-start server (`./mlx-pi plist`) runs with a minimal environment and does **not** see `HF_TOKEN`. If you auto-start *and* use a gated model, set the token in the plist (or pre-download with `./mlx-pi models pull` while authenticated).
+> ⚠️ The **launchd** auto-start server runs with a minimal environment and doesn't inherit your shell's `HF_TOKEN`. To handle this, `./mlx-pi plist` **bakes `HF_TOKEN` into the generated plist** if it's set in your environment when you run it — so export the token *before* generating. The token is stored **in plaintext** in `com.mlx-pi.server.plist`, so keep that file private (don't commit or share it). If no token is set, the plist is generated without one and `plist` tells you so.
 
 > 💡 Want the MLX format. Look for repos under `mlx-community` (or `lmstudio-community` …-MLX-…). Avoid `.gguf` files — those are for llama.cpp/Ollama, not `mlx_lm`. See guide §2 for how to read model names, quantization (`4bit`/`8bit`/`bf16`), and `A3B`/`A4B` MoE "active params".
 

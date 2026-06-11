@@ -715,7 +715,7 @@ PLIST_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
         <key>PATH</key>
         <string>{home}/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
         <key>HF_HOME</key>
-        <string>{home}/.cache/huggingface</string>
+        <string>{home}/.cache/huggingface</string>{hf_token_entry}
     </dict>
     <key>RunAtLoad</key>
     <true/>
@@ -732,8 +732,19 @@ PLIST_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
 """
 
 def cmd_plist(args) -> None:
+    from xml.sax.saxutils import escape
     model = resolve_model(args)
     out = Path(args.output)
+
+    # launchd runs with a minimal env, so a gated/throttled download would fail
+    # there. If HF_TOKEN is set now, bake it in (plaintext) so the auto-start
+    # server can authenticate. Skipped (and noted) when no token is present.
+    token = os.environ.get("HF_TOKEN")
+    hf_token_entry = (
+        f"\n        <key>HF_TOKEN</key>\n        <string>{escape(token)}</string>"
+        if token else ""
+    )
+
     content = PLIST_TEMPLATE.format(
         server_bin=server_bin(),
         model=model,
@@ -741,9 +752,18 @@ def cmd_plist(args) -> None:
         port=args.port,
         home=str(Path.home()),
         state=str(STATE_DIR),
+        hf_token_entry=hf_token_entry,
     )
     out.write_text(content)
     ok(f"Wrote personalized launchd plist → {out}")
+    if token:
+        warn("Baked your HF_TOKEN into the plist (plaintext) so the launchd "
+             "server can download gated models. Keep this file private — don't "
+             "commit or share it.")
+    else:
+        info("No HF_TOKEN in your environment — none was added. Gated-model "
+             "downloads under launchd would fail; export HF_TOKEN and re-run "
+             "'mlx-pi plist' to include it, or pre-download with 'mlx-pi models pull'.")
     info("It is NOT installed. To enable auto-start at login:")
     console.print(f"  [cyan]cp {out} ~/Library/LaunchAgents/[/]")
     console.print(f"  [cyan]launchctl load ~/Library/LaunchAgents/{out.name}[/]")
