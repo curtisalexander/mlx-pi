@@ -19,6 +19,7 @@
 #    up        Start the MLX server in the background; wait until healthy.
 #    down      Stop the background server.
 #    restart   down + up.
+#    use       Switch the served model AND pi's default together (keep in sync).
 #    status    Show running state + health.
 #    logs      Tail the server log.
 #    models    List/pull/rm/clean/sync models; `models doctor` = clean + sync.
@@ -85,6 +86,10 @@ DEFAULT_MAX_TOKENS = 4096
 PI_PROVIDER_ID = "local-mlx"
 PI_CONFIG_DIR = Path.home() / ".pi" / "agent"
 PI_CONFIG_FILE = PI_CONFIG_DIR / "models.json"
+# pi's STARTUP model is chosen here, via defaultProvider + defaultModel — NOT by
+# the order of models in models.json. To change which model pi opens with, this
+# is the file that must be written.
+PI_SETTINGS_FILE = PI_CONFIG_DIR / "settings.json"
 
 # Runtime state (pid + logs) lives here, surviving across terminals.
 STATE_DIR = Path(os.environ.get("MLX_STATE_DIR", Path.home() / ".mlx-pi"))
@@ -318,6 +323,33 @@ def add_model_flags(p: argparse.ArgumentParser) -> None:
 #  pi configuration (registering local-mlx models in ~/.pi/agent/models.json)
 # ============================================================================
 
+def _pin_enabled() -> bool:
+    """Single-model (pinned) mode: register ONLY the chosen model with pi, so
+    pi can't drift to a different model and silently trigger a server hot-swap
+    /reload. Toggle with MLX_PIN_MODEL=1 (or the --pin flag on setup/use)."""
+    return os.environ.get("MLX_PIN_MODEL", "").strip().lower() in ("1", "true", "yes", "on")
+
+def _ram_guard_enabled() -> bool:
+    """Whether to hide models that almost certainly won't fit in RAM from pi's
+    picker, so selecting one can't OOM the box. On by default; disable with
+    MLX_NO_RAM_GUARD=1 (or when you've added swap / know better)."""
+    return os.environ.get("MLX_NO_RAM_GUARD", "").strip().lower() not in ("1", "true", "yes", "on")
+
+def _est_ram_gb(repo: str) -> float | None:
+    """Rough RAM (GB) to load a cached model: on-disk weights + ~25% overhead
+    (matches confirm_download's estimate). None if it isn't cached to size."""
+    b = cache_size_bytes(repo)
+    return (b / 1024 ** 3) * 1.25 if b else None
+
+def _fits_ram(repo: str) -> bool:
+    """True unless we're confident the model exceeds installed RAM. An unknown
+    size or unknown RAM → True: never block a model on a guess."""
+    have = ram_gb()
+    est = _est_ram_gb(repo)
+    if not have or est is None:
+        return True
+    return est <= have
+
 def _pi_multimodal(repo: str) -> bool:
     """Best-effort: which models accept image input (so pi advertises it)."""
     r = repo.lower()
@@ -337,16 +369,47 @@ def _pi_model_entry(repo: str) -> dict:
 
 def _pi_model_ids(primary: str | None = None, force_primary: bool = False) -> list[str]:
     """Repo ids to expose to pi: `primary` first (if forced, or already
-    downloaded), then every other fully-downloaded model in the cache. So pi
-    sees every model you've installed and defaults to the one you chose."""
+    downloaded), then every other fully-downloaded model in the cache — so pi
+    sees every model you've installed and defaults to the one you chose.
+
+    Two policies can trim that list:
+      • pinned mode (MLX_PIN_MODEL)  → only the primary, so pi can't drift.
+      • RAM guard (on by default)    → drop models that clearly won't fit in
+        RAM, EXCEPT the primary (you explicitly asked for that one)."""
     complete = sorted(r for r in _present_repo_ids() if model_status(r) == "complete")
+    kept_primary = primary if (primary and (force_primary or primary in complete)) else None
+    if _pin_enabled() and kept_primary:
+        return [kept_primary]
     ids: list[str] = []
-    if primary and (force_primary or primary in complete):
-        ids.append(primary)
+    if kept_primary:
+        ids.append(kept_primary)
     for r in complete:
-        if r not in ids:
-            ids.append(r)
+        if r in ids:
+            continue
+        if _ram_guard_enabled() and not _fits_ram(r):
+            continue  # too big for this machine — _warn_ram_dropped() surfaces it
+        ids.append(r)
     return ids
+
+def _ram_dropped(ids: list[str]) -> list[str]:
+    """Downloaded models the RAM guard excluded from `ids` — so callers can tell
+    the user instead of silently hiding them ('no silent caps')."""
+    if not _ram_guard_enabled():
+        return []
+    return [r for r in sorted(_present_repo_ids())
+            if model_status(r) == "complete" and r not in ids and not _fits_ram(r)]
+
+def _warn_ram_dropped(ids: list[str]) -> None:
+    """Best-effort heads-up about models hidden from pi for not fitting in RAM."""
+    dropped = _ram_dropped(ids)
+    if not dropped:
+        return
+    warn(f"Hid {len(dropped)} model(s) from pi that likely exceed your "
+         f"{ram_gb()} GB RAM (set MLX_NO_RAM_GUARD=1 to register them anyway):")
+    for r in dropped:
+        est = _est_ram_gb(r)
+        tag = f"  [dim](~{est:.0f} GB to load)[/]" if est else ""
+        console.print(f"    [yellow]🧠[/] {r}{tag}")
 
 def configure_pi(model: str, base_url: str) -> None:
     """Write/merge the local-mlx provider into pi's models.json (native JSON — no
@@ -375,7 +438,11 @@ def configure_pi(model: str, base_url: str) -> None:
         data = {}
     data.setdefault("providers", {})[PI_PROVIDER_ID] = provider
     PI_CONFIG_FILE.write_text(json.dumps(data, indent=2))
-    ok(f"Configured provider '{PI_PROVIDER_ID}' with {len(ids)} model(s) → {base_url}")
+    set_pi_default(model)  # make the chosen model pi's actual startup default
+    suffix = "  [dim](pinned: only this model)[/]" if _pin_enabled() else ""
+    ok(f"Configured provider '{PI_PROVIDER_ID}' with {len(ids)} model(s) → {base_url}{suffix}")
+    info(f"pi will open on [bold]{model}[/] by default.")
+    _warn_ram_dropped(ids)
 
 def refresh_pi_models(primary: str | None = None, force_primary: bool = False) -> int | None:
     """Rewrite the local-mlx provider's model list from the cache, preserving its
@@ -397,10 +464,45 @@ def refresh_pi_models(primary: str | None = None, force_primary: bool = False) -
     ids = _pi_model_ids(primary=primary, force_primary=force_primary)
     prov["models"] = [_pi_model_entry(r) for r in ids]
     PI_CONFIG_FILE.write_text(json.dumps(data, indent=2))
+    if force_primary and primary:  # an explicit switch → also move pi's default
+        set_pi_default(primary)
+    _warn_ram_dropped(ids)
     return len(ids)
 
+def pi_settings() -> dict:
+    """pi's settings.json (where its startup model lives), or {} if unreadable."""
+    try:
+        return json.loads(PI_SETTINGS_FILE.read_text())
+    except Exception:
+        return {}
+
+def set_pi_default(model: str) -> None:
+    """Make `model` pi's startup default. pi reads its opening model from
+    settings.json (defaultProvider + defaultModel), NOT the models.json list
+    order — so writing here is what actually changes which model pi opens with.
+    Merges (preserving other settings) and keeps the 5 most recent backups."""
+    PI_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    if PI_SETTINGS_FILE.exists():
+        backup = PI_SETTINGS_FILE.with_suffix(f".json.bak.{int(time.time())}")
+        backup.write_text(PI_SETTINGS_FILE.read_text())
+        for f in sorted(PI_CONFIG_DIR.glob("settings.json.bak.*"))[:-5]:
+            f.unlink(missing_ok=True)
+    s = pi_settings()
+    s["defaultProvider"] = PI_PROVIDER_ID
+    s["defaultModel"] = model
+    PI_SETTINGS_FILE.write_text(json.dumps(s, indent=2))
+
 def configured_model_id() -> str | None:
-    """pi's default model (first in its list), if any."""
+    """pi's actual startup model. Read from settings.json (defaultProvider +
+    defaultModel) — the list order in models.json does NOT decide this. Falls
+    back to the first registered model only when settings name no default for
+    our provider; None if pi defaults to a different provider entirely."""
+    s = pi_settings()
+    prov = s.get("defaultProvider")
+    if prov == PI_PROVIDER_ID and s.get("defaultModel"):
+        return s["defaultModel"]
+    if prov and prov != PI_PROVIDER_ID:
+        return None  # pi opens on a different provider — none of ours is default
     ids = configured_model_ids()
     return ids[0] if ids else None
 
@@ -508,6 +610,8 @@ def cmd_setup(args) -> None:
     model = resolve_model(args)
     port = args.port
     base_url = f"http://localhost:{port}/v1"
+    if getattr(args, "pin", False):
+        os.environ["MLX_PIN_MODEL"] = "1"  # configure_pi() registers only `model`
 
     console.print("\n[bold cyan]🍎 mlx-pi setup — MLX + pi for Apple Silicon[/]")
     info(f"Model:    [bold]{model}[/]")
@@ -692,6 +796,45 @@ def cmd_restart(args) -> None:
     cmd_down(args)
     cmd_up(args)
 
+def cmd_use(args) -> None:
+    """Switch the served model AND pi's default together — the one command that
+    keeps the two in sync. Downloads the model if needed, restarts the server on
+    it, then points pi's default at that same model (only it, if pinned)."""
+    require_mlx()
+    model = resolve_target_model(args)   # positional REPO_ID wins, else flags
+    args.model = model                   # lock subsequent resolve_model() to it
+    if getattr(args, "pin", False):
+        os.environ["MLX_PIN_MODEL"] = "1"
+
+    # 1. Make sure it's downloaded (same confirm + fetch path as `models pull`).
+    if model_status(model) != "complete":
+        if not confirm_download(model, args.yes):
+            warn("Cancelled — model not downloaded.")
+            return
+        _hf_download(model)
+        if model_status(model) != "complete":
+            warn("Download ended but the model looks incomplete — "
+                 "re-run 'mlx-pi models pull' to retry.")
+            return
+
+    # 2. Restart the server on this model.
+    step(f"Switching the served model to {model}")
+    cmd_down(args)
+    if not cmd_up(args):
+        return
+
+    # 3. Point pi's default at the same model (pinned → only it).
+    base_url = f"http://localhost:{args.port}/v1"
+    if PI_CONFIG_FILE.exists():
+        n = refresh_pi_models(primary=model, force_primary=True)
+    else:
+        configure_pi(model, base_url)
+        n = len(configured_model_ids())
+    if n is not None:
+        tag = "  [dim](pinned)[/]" if _pin_enabled() else ""
+        ok(f"Server and pi are now both on [bold]{model}[/] — pi sees {n} model(s).{tag}")
+    info("Restart pi (or use /model inside it) to pick up the change.")
+
 def cmd_status(args) -> None:
     host, port = args.host, args.port
     t = Table(show_header=False, box=None, pad_edge=False)
@@ -702,8 +845,14 @@ def cmd_status(args) -> None:
     t.add_row("endpoint", f"http://{host}:{port}")
     t.add_row("process", f"[green]running[/] (PID {pid})" if pid else "[red]not running[/]")
     t.add_row("health", "[green]healthy 🟢[/]" if healthy else "[red]not responding 🔴[/]")
-    if pid and (served := served_model(pid)):
-        t.add_row("model", served)
+    served = served_model(pid) if pid else None
+    if served:
+        t.add_row("model (preloaded)", served)
+    pi_default = configured_model_id()
+    if pi_default:
+        t.add_row("pi default model", pi_default)
+    if _pin_enabled():
+        t.add_row("pin mode", "[green]on[/] — pi sees only the served model")
     t.add_row("log", str(LOG_FILE))
     console.print("[bold]MLX server status[/]")
     console.print(t)
@@ -714,6 +863,20 @@ def cmd_status(args) -> None:
     elif pid and not healthy:
         info("Process is up but not answering yet — likely still loading/downloading "
              "the model (watch './mlx-pi logs').")
+    # Sync check: pi requests a model by name and mlx_lm.server hot-swaps to it,
+    # so the launched (preloaded) model is only a default. We can't observe the
+    # currently-resident model (the server doesn't expose or log it), but we CAN
+    # flag when pi's default differs from what was preloaded — that first request
+    # will force a reload (slower, more RAM).
+    if served and pi_default and served != pi_default:
+        warn(f"pi defaults to [bold]{pi_default}[/], but the server preloaded "
+             f"[bold]{served}[/]. pi's first request will make the server reload "
+             f"(slower, more RAM). Align both with [bold]mlx-pi use {pi_default}[/], "
+             f"or just pick the served model inside pi.")
+    elif served and len(configured_model_ids()) > 1:
+        console.print("  [dim]Note: pi can pick any registered model; the server "
+                      "hot-swaps per request, so choosing a non-preloaded model "
+                      "reloads it on first use.[/]")
 
 def cmd_logs(args) -> None:
     if not LOG_FILE.exists():
@@ -1110,6 +1273,8 @@ def build_parser() -> argparse.ArgumentParser:
     add_model_flags(sp); server_opts(sp)
     sp.add_argument("-p", "--prefetch", action="store_true", help="download the model now (with size check)")
     sp.add_argument("--no-link", action="store_true", help="don't symlink mlx-pi onto your PATH")
+    sp.add_argument("--pin", action="store_true",
+                    help="register ONLY this model with pi (no hot-swap drift)")
     sp.set_defaults(func=cmd_setup)
 
     sp = sub.add_parser("up", help="start the MLX server in the background")
@@ -1120,6 +1285,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("restart", help="restart the background server")
     add_model_flags(sp); server_opts(sp); sp.set_defaults(func=cmd_restart)
+
+    sp = sub.add_parser("use", help="switch the served model AND pi's default together")
+    sp.add_argument("repo", nargs="?", metavar="REPO_ID",
+                    help="model id to switch to (or use a preset flag below)")
+    add_model_flags(sp); server_opts(sp)
+    sp.add_argument("--pin", action="store_true",
+                    help="register ONLY this model with pi (no hot-swap drift)")
+    sp.set_defaults(func=cmd_use)
 
     sp = sub.add_parser("status", help="show running state + health")
     server_opts(sp); sp.set_defaults(func=cmd_status)
@@ -1188,6 +1361,7 @@ def print_overview() -> None:
             ("up", "start the MLX server in the background; wait until healthy"),
             ("down", "stop the background server"),
             ("restart", "down + up"),
+            ("use", "switch the served model AND pi's default together (keeps them in sync)"),
             ("run", "run the server in the FOREGROUND (Ctrl-C to stop)"),
         ]),
         ("Inspect", [

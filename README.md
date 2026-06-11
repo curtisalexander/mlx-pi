@@ -62,7 +62,8 @@ You ──run──▶ ./mlx-pi pi ──HTTP /v1/chat/completions──▶ MLX 
 ./mlx-pi up         Start the MLX server in the background; wait until healthy.
 ./mlx-pi down       Stop the background server.
 ./mlx-pi restart    down + up.
-./mlx-pi status     Show running state + health.
+./mlx-pi use        Switch the served model AND pi's default together (download if needed; --pin to lock pi to it).
+./mlx-pi status     Show running state + health (flags drift between the served model and pi's default).
 ./mlx-pi logs       Tail the server log.
 ./mlx-pi models       List preset + downloaded models, and what pi is set to use.
 ./mlx-pi models pull  Download a model to the cache (no server; resumes partials).
@@ -122,6 +123,17 @@ pi can use **every model you've downloaded**, not just the one from `setup`. The
 
 `models doctor` is the "just make everything tidy and aligned" button — it runs `clean` then `sync` in one go. The model you passed to `setup` (or the existing default) stays pi's **default**; the rest are selectable via `/model`. Restart pi — or use `/model` — to pick up changes made while it's running. In `./mlx-pi models`, the `pi` column shows `▸` for pi's default and `✓` for the other models pi can use.
 
+### Keeping the server and pi in sync
+
+The MLX server is launched with **one** model (its `--model`), but that's only a *preload/default*: `mlx_lm.server` **hot-swaps to whatever model a request names**. So when you `/model` to a different model inside pi, the server reloads that model on the fly. You won't get the wrong weights — but the swap costs a reload (seconds for small models, much longer for big ones) and the new model's RAM. The drift to watch for is *operational*, not correctness.
+
+There are two separate things to keep aligned: which model the **server preloaded** (its `--model`) and which model **pi opens on**. pi's startup model lives in `~/.pi/agent/settings.json` (`defaultProvider` + `defaultModel`) — **not** in the order of the `models.json` list — so changing it means writing that file, which `setup` and `use` do for you.
+
+- **`./mlx-pi status`** shows the **preloaded** model and **pi's default** side by side, and warns when they differ (pi's first request would force a reload). It can't show the *currently-resident* model after a swap — `mlx_lm.server` neither exposes nor logs it.
+- **`./mlx-pi use <model>`** is the one command that moves both sides together: it downloads the model if needed, restarts the server on it, and sets it as pi's `defaultModel`. Use this instead of `up --model X` when you want pi and the server to agree.
+- **Pinned mode** (`--pin` on `setup`/`use`, or `export MLX_PIN_MODEL=1`) registers **only** the served model with pi, so pi's picker can't drift to something that triggers a surprise reload. Good default on low-RAM machines.
+- **RAM guard** (on by default) hides models from pi's picker that clearly won't fit in your installed RAM, so selecting one can't OOM the box. The model you explicitly chose is always kept, and hidden models are reported (not silently dropped). Disable with `export MLX_NO_RAM_GUARD=1`.
+
 ### Hugging Face authentication (`HF_TOKEN`)
 
 Set a [Hugging Face token](https://huggingface.co/settings/tokens) if you hit **gated models** (you must accept the model's license first) or want **higher download rate limits** (anonymous downloads can be throttled — a common cause of slow pulls):
@@ -175,6 +187,8 @@ All optional — sensible defaults otherwise.
 | Variable | Effect |
 |----------|--------|
 | `MLX_MODEL` | Default model id when no `--model`/preset flag is given (persists your choice across `up`/`pi`/`setup`). |
+| `MLX_PIN_MODEL` | `1` to register **only** the served model with pi (no hot-swap drift); same as `--pin`. |
+| `MLX_NO_RAM_GUARD` | `1` to register models even if they likely exceed installed RAM (the guard is on by default). |
 | `MLX_STATE_DIR` | Where the PID file and server log live (default `~/.mlx-pi`). |
 | `MLX_LOG_MAX_BYTES` | Cap for `server.log` before it's trimmed (default `10485760` = 10 MB). |
 | `MLX_STARTUP_TIMEOUT` | Seconds `up` waits for the server to become healthy before giving up (default `600`). |
