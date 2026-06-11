@@ -20,7 +20,7 @@
 #    restart   down + up.
 #    status    Show running state + health.
 #    logs      Tail the server log.
-#    models    List models; `models pull` downloads one, `models rm` deletes one.
+#    models    List models; pull/rm/clean download, delete, or prune temp files.
 #    run       Run the server in the FOREGROUND (Ctrl-C to stop).
 #    pi        Ensure the server is up, then launch the pi agent.
 #    plist     Generate a personalized launchd plist (does NOT install it).
@@ -554,16 +554,22 @@ def _present_repo_ids() -> list[str]:
             for d in HF_CACHE.iterdir()
             if d.is_dir() and d.name.startswith("models--")]
 
-def _gb(n: int | None) -> str:
-    return f"{n / 1024 ** 3:.1f} GB" if n else "—"
+def _size(n: int | None) -> str:
+    """Human-readable byte size (GB/MB/KB), so small cleanups don't read 0.0 GB."""
+    if not n:
+        return "—"
+    for unit, scale in (("GB", 1024 ** 3), ("MB", 1024 ** 2), ("KB", 1024)):
+        if n >= scale:
+            return f"{n / scale:.1f} {unit}"
+    return f"{n} B"
 
 def _download_cell(repo: str) -> str:
     """Rendered 'Downloaded' column for a repo, by cache status."""
     s = model_status(repo)
     if s == "complete":
-        return f"[green]✅ {_gb(cache_size_bytes(repo))}[/]"
+        return f"[green]✅ {_size(cache_size_bytes(repo))}[/]"
     if s == "partial":
-        return f"[yellow]⏳ partial ({_gb(cache_size_bytes(repo))} so far)[/]"
+        return f"[yellow]⏳ partial ({_size(cache_size_bytes(repo))} so far)[/]"
     return "[dim]— not yet[/]"
 
 def cmd_models(args) -> None:
@@ -621,9 +627,9 @@ def _hf_download(repo: str) -> None:
 def _pull_done(model: str, verb: str) -> None:
     """Report a finished pull, pruning stale temp files and noting freed space."""
     freed = prune_stale_incomplete(model)
-    msg = f"{verb}: {model}  ({_gb(cache_size_bytes(model))})"
+    msg = f"{verb}: {model}  ({_size(cache_size_bytes(model))})"
     if freed:
-        msg += f"  ·  cleaned up {_gb(freed)} of leftover temp files"
+        msg += f"  ·  cleaned up {_size(freed)} of leftover temp files"
     ok(msg)
 
 def cmd_models_pull(args) -> None:
@@ -633,7 +639,7 @@ def cmd_models_pull(args) -> None:
         _pull_done(model, "Already downloaded")
         return
     if status == "partial":
-        info(f"Resuming partial download: {model}  ({_gb(cache_size_bytes(model))} so far)")
+        info(f"Resuming partial download: {model}  ({_size(cache_size_bytes(model))} so far)")
     elif not confirm_download(model, args.yes):  # absent → show size + confirm
         warn("Download cancelled.")
         return
@@ -654,11 +660,30 @@ def cmd_models_rm(args) -> None:
     if model == configured_model_id():
         warn(f"Heads up: pi is currently configured to use this model ({model}).")
     if not args.yes and not Confirm.ask(
-            f"  [yellow]❓ Delete {model} ({_gb(size)}) from the cache?[/]", default=False):
+            f"  [yellow]❓ Delete {model} ({_size(size)}) from the cache?[/]", default=False):
         warn("Cancelled.")
         return
     shutil.rmtree(base, ignore_errors=True)
-    ok(f"Removed {model} — freed ~{_gb(size)}.")
+    ok(f"Removed {model} — freed ~{_size(size)}.")
+
+def cmd_models_clean(args) -> None:
+    """Sweep stale *.incomplete temp files across every cached model. Safe:
+    in-progress/interrupted downloads (final blob still missing) are kept."""
+    freed = 0
+    kept = []
+    for repo in _present_repo_ids():
+        freed += prune_stale_incomplete(repo)
+        if model_status(repo) == "partial":
+            kept.append(repo)
+    if freed:
+        ok(f"Cleaned up {_size(freed)} of stale temp files.")
+    else:
+        info("No stale temp files found — cache is already clean.")
+    if kept:
+        warn("Kept these in-progress/interrupted downloads "
+             "(finish with 'mlx-pi models pull'):")
+        for r in kept:
+            console.print(f"    [yellow]⏳[/] {r}")
 
 def trim_log() -> None:
     """Cap server.log: if it exceeds LOG_MAX_BYTES, keep only the most recent
@@ -946,6 +971,8 @@ def build_parser() -> argparse.ArgumentParser:
     add_model_flags(rp)
     rp.add_argument("-y", "--yes", action="store_true", help="skip the delete confirmation")
     rp.set_defaults(func=cmd_models_rm)
+    cp = msub.add_parser("clean", help="remove stale *.incomplete temp files (frees disk)")
+    cp.set_defaults(func=cmd_models_clean)
 
     sp = sub.add_parser("run", help="run the server in the foreground")
     add_model_flags(sp); server_opts(sp); sp.set_defaults(func=cmd_run)
@@ -994,6 +1021,7 @@ def print_overview() -> None:
             ("models", "list presets + downloaded models (and pi's choice)"),
             ("models pull", "download a model to the cache (no server)"),
             ("models rm", "delete a model from the cache to free disk"),
+            ("models clean", "remove stale *.incomplete temp files"),
         ]),
         ("Agent & install", [
             ("setup", "install mlx-lm + pi, configure, symlink mlx-pi onto PATH"),
