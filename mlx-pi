@@ -42,6 +42,7 @@ from pathlib import Path
 
 import httpx
 from rich.console import Console
+from rich.panel import Panel
 from rich.prompt import Confirm
 from rich.table import Table
 
@@ -347,9 +348,9 @@ def configure_pi(model: str, base_url: str) -> None:
     ok(f"Configured provider '{PI_PROVIDER_ID}' → {base_url}")
 
 def _print_setup_summary(model: str) -> None:
-    console.print("\n[bold green]╔═══════════════════════════════════╗[/]")
-    console.print("[bold green]║          ✅  SETUP COMPLETE        ║[/]")
-    console.print("[bold green]╚═══════════════════════════════════╝[/]")
+    console.print()
+    console.print(Panel("[bold green]✅  SETUP COMPLETE[/]",
+                        expand=False, padding=(0, 4), border_style="green"))
     console.print("\n[bold]Next steps:[/]")
     console.print("  1️⃣  [cyan]./mlx-pi up[/]      start the MLX server (background)")
     console.print("  2️⃣  [cyan]./mlx-pi pi[/]      launch the coding agent")
