@@ -37,6 +37,7 @@ The default model is a small **Qwen3 4B** (~2 GB) so you can confirm the whole p
 | `index.html` | Redirect to the guide, so GitHub Pages serves it at the repo's Pages URL. |
 | `README.md` | This file. |
 | `LICENSE` | MIT license. |
+| `test_mlx_pi.py` | Lightweight tests (no pytest). Run `./test_mlx_pi.py`. |
 
 ---
 
