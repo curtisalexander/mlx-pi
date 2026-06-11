@@ -140,9 +140,9 @@
     </div>
     <div class="card">
       <span class="pill cli">install once</span>
-      <h3>⚙️ MLX / mlx-lm</h3>
-      <p><b>MLX</b> is Apple’s array framework, purpose-built for Apple-Silicon unified memory and the M5’s Metal-4 tensor accelerators. <b>mlx-lm</b> is the package on top that runs LLMs and ships the CLIs you’ll actually call: <code class="inline">mlx_lm.server</code>, <code class="inline">mlx_lm.generate</code>, <code class="inline">mlx_lm.chat</code>.</p>
-      <p class="lead">Installed by uv into <code class="inline">~/.local/share/uv/tools/mlx-lm</code>; commands symlinked into <code class="inline">~/.local/bin</code>.</p>
+      <h3>⚙️ MLX / mlx-lm / mlx-vlm</h3>
+      <p><b>MLX</b> is Apple’s array framework, purpose-built for Apple-Silicon unified memory and the M5’s Metal-4 tensor accelerators. Two packages on top run models, and <code class="inline">mlx-pi</code> picks between them per model: <b>mlx-lm</b> (Apple’s ml-explore) serves <b>text</b> LLMs — <code class="inline">mlx_lm.server</code>, <code class="inline">mlx_lm.generate</code>, <code class="inline">mlx_lm.chat</code>; <b>mlx-vlm</b> (community <a href="https://github.com/Blaizzy/mlx-vlm">Blaizzy/mlx-vlm</a>) serves <b>vision</b> models that accept images — <code class="inline">mlx_vlm.server</code>, <code class="inline">mlx_vlm.generate</code>. mlx-lm is text-only and rejects images, so vision models like Gemma 4 must run on mlx-vlm.</p>
+      <p class="lead">Both installed by uv into <code class="inline">~/.local/share/uv/tools/</code>; commands symlinked into <code class="inline">~/.local/bin</code>.</p>
     </div>
     <div class="card">
       <span class="pill cli">install once</span>
@@ -153,7 +153,7 @@
     <div class="card">
       <span class="pill daemon">runs in background</span>
       <h3>🌐 The MLX server</h3>
-      <p>When you run <code class="inline">mlx_lm.server</code>, it loads your model into memory and listens on <code class="inline">http://localhost:8080</code>, exposing OpenAI-style routes (<code class="inline">/v1/chat/completions</code>, <code class="inline">/v1/models</code>). This is the <b>only long-running process</b>. It is a daemon you start and stop; it is <em>not</em> a system service and won’t auto-start on boot.</p>
+      <p>When you run <code class="inline">mlx-pi up</code>, it launches the right backend for your model — <code class="inline">mlx_lm.server</code> for text models, <code class="inline">mlx_vlm.server</code> for vision models — which loads your model into memory and listens on <code class="inline">http://localhost:8080</code>, exposing the same OpenAI-style routes (<code class="inline">/v1/chat/completions</code>, <code class="inline">/v1/models</code>). Because both speak the same wire format, pi and <code class="inline">mlx-pi</code> treat them identically. This is the <b>only long-running process</b>. It is a daemon you start and stop; it is <em>not</em> a system service and won’t auto-start on boot.</p>
     </div>
   </div>
 
@@ -175,7 +175,9 @@
 
   <div class="note">💡 <b>Manage models with <code class="inline">mlx-pi models</code>.</b> Bare <code class="inline">mlx-pi models</code> lists the built-in presets — which are downloaded (with on-disk size; a partial/interrupted download is flagged <code class="inline">⏳ partial</code>) and which one pi is configured to call. <code class="inline">mlx-pi models pull [--qwen-coder|--gemma|--model &lt;id&gt;]</code> downloads a model to the cache without starting a server (and resumes partials); <code class="inline">mlx-pi models rm [&hellip;]</code> deletes one to reclaim disk; <code class="inline">mlx-pi models clean</code> sweeps stale <code class="inline">*.incomplete</code> temp files left by interrupted downloads (keeping any still in progress). <b>pi sees every model you've downloaded</b> — <code class="inline">setup</code> and <code class="inline">models pull</code> register them in <code class="inline">~/.pi/agent/models.json</code> automatically (switch between them with <code class="inline">/model</code> inside pi); <code class="inline">mlx-pi models sync</code> rebuilds that list from the cache if it ever drifts, and <code class="inline">mlx-pi models doctor</code> is the one-shot tidy-up that runs <code class="inline">clean</code> + <code class="inline">sync</code> together. In <code class="inline">mlx-pi models</code> the <b>pi</b> column shows <code class="inline">▸</code> for pi's default and <code class="inline">✓</code> for the others it can use. Downloads still happen lazily on the first <code class="inline">up</code> too, but <code class="inline">pull</code> lets you fetch ahead of time without loading the model into RAM.</div>
 
-  <div class="note">🔄 <b>Keep the server and pi in sync with <code class="inline">mlx-pi use &lt;model&gt;</code>.</b> Two things drift apart: the model the <b>server preloaded</b> (its <code class="inline">--model</code>) and the model <b>pi opens on</b>. The server's <code class="inline">--model</code> is only a default — <code class="inline">mlx_lm.server</code> hot-swaps to whatever model each request names, reloading it on the fly (cheap for the 4B, costly for a 30B). And pi's startup model lives in <code class="inline">~/.pi/agent/settings.json</code> (<code class="inline">defaultModel</code>), <em>not</em> the order of <code class="inline">models.json</code>. If a running server is on a different model, passing an explicit flag to <code class="inline">up</code>/<code class="inline">pi</code> (e.g. <code class="inline">mlx-pi pi --gemma</code>) now <b>restarts the server onto that model</b> rather than just warning — and <code class="inline">pi --&lt;flag&gt;</code> also sets it as pi's default, so the server and pi open in lockstep. (A bare <code class="inline">mlx-pi up</code> with no flag leaves the running server as-is.) <code class="inline">mlx-pi use --qwen-coder</code> (or <code class="inline">use &lt;id&gt;</code>) does the same switch <em>without</em> launching pi: download if needed, restart the server, set pi's default. <code class="inline">mlx-pi status</code> shows the preloaded model vs pi's default and warns when they differ. On low-RAM machines, <code class="inline">--pin</code> (or <code class="inline">MLX_PIN_MODEL=1</code>) registers <em>only</em> the served model with pi so its picker can't drift into a surprise reload, and a RAM guard hides models that wouldn't fit (override with <code class="inline">MLX_NO_RAM_GUARD=1</code>).</div>
+  <div class="note">🔄 <b>Keep the server and pi in sync with <code class="inline">mlx-pi use &lt;model&gt;</code>.</b> Two things drift apart: the model the <b>server preloaded</b> (its <code class="inline">--model</code>) and the model <b>pi opens on</b>. The server's <code class="inline">--model</code> is only a default — the server hot-swaps to whatever model each request names, reloading it on the fly (cheap for the 4B, costly for a 30B). And pi's startup model lives in <code class="inline">~/.pi/agent/settings.json</code> (<code class="inline">defaultModel</code>), <em>not</em> the order of <code class="inline">models.json</code>. If a running server is on a different model, passing an explicit flag to <code class="inline">up</code>/<code class="inline">pi</code> (e.g. <code class="inline">mlx-pi pi --gemma</code>) now <b>restarts the server onto that model</b> rather than just warning — and <code class="inline">pi --&lt;flag&gt;</code> also sets it as pi's default, so the server and pi open in lockstep. (A bare <code class="inline">mlx-pi up</code> with no flag leaves the running server as-is.) <code class="inline">mlx-pi use --qwen-coder</code> (or <code class="inline">use &lt;id&gt;</code>) does the same switch <em>without</em> launching pi: download if needed, restart the server, set pi's default. <code class="inline">mlx-pi status</code> shows the preloaded model vs pi's default and warns when they differ. On low-RAM machines, <code class="inline">--pin</code> (or <code class="inline">MLX_PIN_MODEL=1</code>) registers <em>only</em> the served model with pi so its picker can't drift into a surprise reload, and a RAM guard hides models that wouldn't fit (override with <code class="inline">MLX_NO_RAM_GUARD=1</code>).</div>
+
+  <div class="note">🖼️ <b>Text vs vision backends (images).</b> Some models accept <b>images</b>, not just text (e.g. <b>Gemma 4</b>). These need <code class="inline">mlx_vlm.server</code> — Apple's <code class="inline">mlx_lm.server</code> is text-only and rejects images with <em>"Only 'text' content type is supported."</em> <code class="inline">mlx-pi</code> picks the backend for you: <code class="inline">mlx-pi up --gemma</code> launches <code class="inline">mlx_vlm.server</code> (images work in pi), while text models like Qwen run on <code class="inline">mlx_lm.server</code>. A model's image capability is advertised to pi to match, so pi only offers image paste when the backend can handle it. <code class="inline">mlx-pi status</code> shows the live backend (<code class="inline">backend  vision · mlx_vlm.server (images ✅)</code>). Detection is a name heuristic (Gemma 4, <code class="inline">*-VL</code>, <code class="inline">llava</code>, <code class="inline">pixtral</code>, <code class="inline">idefics</code>, <code class="inline">moondream</code>, <code class="inline">smolvlm</code>, anything with <code class="inline">vision</code>); override a misclassified model with <code class="inline">MLX_VISION_MODELS</code> / <code class="inline">MLX_TEXT_MODELS</code> (comma-separated repo ids). Note <code class="inline">mlx-vlm</code> is a community package (not Apple-maintained); text speed is comparable, and sending an image adds a one-time vision-encode cost.</div>
 
   <div class="note">🔑 <b>Hugging Face token (<code class="inline">HF_TOKEN</code>).</b> Set a <a href="https://huggingface.co/settings/tokens" style="color:var(--accent)">token</a> for <b>gated models</b> (accept the license first) or <b>faster downloads</b> — anonymous pulls get rate-limited, a common cause of slow downloads. <code class="inline">export HF_TOKEN=hf_xxxxx</code> (fish: <code class="inline">set -Ux HF_TOKEN hf_xxxxx</code>); <code class="inline">models pull</code>, <code class="inline">up</code>, and <code class="inline">pi</code> inherit it automatically. <b>launchd:</b> the auto-start server runs with a minimal environment, so <code class="inline">mlx-pi plist</code> <b>bakes <code class="inline">HF_TOKEN</code> into the generated plist</b> when it's set in your shell — export it before generating. It's stored in plaintext, so keep <code class="inline">com.mlx-pi.server.plist</code> private.</div>
 
@@ -268,14 +270,16 @@ flowchart TB
     subgraph INSTALL["🧰 Installed once (global)"]
       direction LR
       UV["uv<br/><small>~/.local/bin</small>"]
-      MLXLM["mlx-lm CLIs<br/><small>mlx_lm.server / generate / chat</small>"]
+      MLXLM["mlx-lm CLIs<br/><small>mlx_lm.server — text</small>"]
+      MLXVLM["mlx-vlm CLIs<br/><small>mlx_vlm.server — vision</small>"]
       PI["pi agent<br/><small>npm -g</small>"]
       UV -. installs .-> MLXLM
+      UV -. installs .-> MLXVLM
     end
 
     subgraph RUNTIME["🔴 Running while you work"]
       direction TB
-      SERVER["🌐 MLX server<br/><small>localhost:8080 · OpenAI API</small>"]
+      SERVER["🌐 MLX server<br/><small>localhost:8080 · OpenAI API<br/>mlx_lm or mlx_vlm per model</small>"]
       MODEL_MEM["🧠 Model in unified memory<br/><small>M5 Metal-4 tensor cores</small>"]
       SERVER --- MODEL_MEM
     end
@@ -314,12 +318,14 @@ flowchart TB
   <pre><code><span class="tok-cmd">curl</span> <span class="tok-flag">-LsSf</span> https://astral.sh/uv/install.sh | <span class="tok-cmd">sh</span>
 <span class="tok-comment"># installs to ~/.local/bin and adds it to your shell PATH</span></code></pre>
 
-  <div class="step-h"><div class="dot">2</div><h3>Install MLX globally as a uv tool</h3></div>
-  <p><span class="pill once">one-time</span> Creates an isolated env for mlx-lm but exposes its CLIs everywhere — the “install globally, use across projects” behavior you want. (mlx-lm pulls in <code class="inline">mlx</code> automatically.)</p>
+  <div class="step-h"><div class="dot">2</div><h3>Install the MLX backends globally as uv tools</h3></div>
+  <p><span class="pill once">one-time</span> Installs <b>both</b> backends into isolated envs but exposes their CLIs everywhere — mlx-lm for text models, mlx-vlm for vision models. (Each pulls in <code class="inline">mlx</code> automatically.)</p>
   <pre><code><span class="tok-cmd">uv</span> tool install mlx-lm
-<span class="tok-comment"># later, to update:  uv tool install --upgrade mlx-lm</span>
+<span class="tok-cmd">uv</span> tool install mlx-vlm
+<span class="tok-comment"># later, to update:  uv tool install --upgrade mlx-lm mlx-vlm</span>
 <span class="tok-comment"># verify:</span>
-<span class="tok-cmd">mlx_lm.server</span> <span class="tok-flag">--help</span></code></pre>
+<span class="tok-cmd">mlx_lm.server</span> <span class="tok-flag">--help</span>
+<span class="tok-cmd">mlx_vlm.server</span> <span class="tok-flag">--help</span></code></pre>
   <div class="note">Why uv tool and not <code class="inline">uv pip</code> / a venv? <code class="inline">uv tool</code> is for <b>applications you run by name</b> (like pipx). One global copy, always on PATH, zero per-project setup.</div>
 
   <div class="step-h"><div class="dot">3</div><h3>Install pi (the harness)</h3></div>

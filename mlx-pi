@@ -14,8 +14,9 @@
 #  then caches it. No virtualenv to manage.
 #
 #  SUBCOMMANDS
-#    setup     Install mlx-lm + pi, point pi at the local server (all
-#              downloaded models), and symlink mlx-pi onto your PATH.
+#    setup     Install the MLX backends (mlx-lm for text, mlx-vlm for vision)
+#              + pi, point pi at the local server (all downloaded models), and
+#              symlink mlx-pi onto your PATH.
 #    up        Start the MLX server in the background; wait until healthy.
 #    down      Stop the background server.
 #    restart   down + up.
@@ -350,10 +351,27 @@ def _fits_ram(repo: str) -> bool:
         return True
     return est <= have
 
-def _pi_multimodal(repo: str) -> bool:
-    """Best-effort: which models accept image input (so pi advertises it)."""
+def is_vision_model(repo: str) -> bool:
+    """Best-effort: is this a Vision-Language Model (accepts image input)?
+
+    This is the single source of truth that decides BOTH which server backend
+    runs the model (mlx_vlm.server for vision, mlx_lm.server for text-only) AND
+    whether pi advertises image input — so the two can never disagree. It's a
+    name heuristic (we can't load the model just to ask); override per-model with
+    MLX_VISION_MODELS / MLX_TEXT_MODELS (comma-separated repo ids) when a name
+    fools it."""
+    if repo in _env_id_set("MLX_VISION_MODELS"):
+        return True
+    if repo in _env_id_set("MLX_TEXT_MODELS"):
+        return False
     r = repo.lower()
-    return repo == GEMMA_MODEL or "gemma-4" in r or "-vl" in r or "vision" in r
+    return (repo == GEMMA_MODEL or "gemma-4" in r or "-vl" in r or "vision" in r
+            or "llava" in r or "pixtral" in r or "idefics" in r or "moondream" in r
+            or "smolvlm" in r or "-vlm" in r)
+
+def _env_id_set(var: str) -> set[str]:
+    """Comma/space-separated repo ids from an env var, as a set (empty if unset)."""
+    return {s.strip() for s in re.split(r"[,\s]+", os.environ.get(var, "")) if s.strip()}
 
 def _pi_model_entry(repo: str) -> dict:
     """One pi models.json entry for a model repo id."""
@@ -361,7 +379,7 @@ def _pi_model_entry(repo: str) -> dict:
         "id": repo,
         "name": f"MLX · {repo.split('/')[-1]}",
         "reasoning": False,
-        "input": ["text", "image"] if _pi_multimodal(repo) else ["text"],
+        "input": ["text", "image"] if is_vision_model(repo) else ["text"],
         "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
         "contextWindow": 131072,
         "maxTokens": 8192,
@@ -566,19 +584,56 @@ def served_model(pid: int) -> str | None:
             return parts[i + 1]
     return None
 
+def server_backend(pid: int) -> str | None:
+    """Which backend the running server is — 'vlm', 'lm', or None — from its
+    argv. Lets status show whether images are actually supported right now."""
+    try:
+        out = subprocess.check_output(["ps", "-ww", "-p", str(pid), "-o", "command="], text=True)
+    except Exception:
+        return None
+    if VLM_SERVER in out:
+        return "vlm"
+    if LM_SERVER in out:
+        return "lm"
+    return None
+
 def _model_requested(args) -> bool:
     """True if the user explicitly chose a model (flag or MLX_MODEL), vs the
     implicit default — so we only warn about a mismatch when they actually asked."""
     return bool(getattr(args, "qwen_coder", False) or getattr(args, "gemma", False)
                 or getattr(args, "model", None) or os.environ.get("MLX_MODEL"))
 
-def server_bin() -> str:
-    """Absolute path to mlx_lm.server (uv installs it to ~/.local/bin)."""
-    return have("mlx_lm.server") or str(Path.home() / ".local" / "bin" / "mlx_lm.server")
+# Two backends, picked per-model by is_vision_model():
+#   • mlx_lm.server  (Apple's ml-explore) — text-only LLMs.
+#   • mlx_vlm.server (community: Blaizzy/mlx-vlm) — Vision-Language Models, the
+#     only one of the two that accepts image input. Both are OpenAI-compatible
+#     (same --model/--host/--port/--max-tokens flags, same /v1/models health).
+LM_SERVER = "mlx_lm.server"
+VLM_SERVER = "mlx_vlm.server"
 
-def require_mlx() -> None:
-    if not have("mlx_lm.server"):
-        err("mlx_lm.server not found. Run './mlx-pi setup' first (then open a new terminal).")
+def backend_name(model: str) -> str:
+    """The server binary name that serves `model` (vision → mlx_vlm.server)."""
+    return VLM_SERVER if is_vision_model(model) else LM_SERVER
+
+def server_bin(model: str | None = None) -> str:
+    """Absolute path to the server binary for `model`'s backend (uv installs both
+    to ~/.local/bin). With no model, defaults to the text backend."""
+    name = backend_name(model) if model else LM_SERVER
+    return have(name) or str(Path.home() / ".local" / "bin" / name)
+
+def generate_bin(model: str) -> str:
+    """The one-shot generate CLI matching `model`'s backend (for prefetch warms)."""
+    name = "mlx_vlm.generate" if is_vision_model(model) else "mlx_lm.generate"
+    return have(name) or str(Path.home() / ".local" / "bin" / name)
+
+def require_backend(model: str) -> None:
+    """Ensure the server binary for `model`'s backend is installed."""
+    name = backend_name(model)
+    if not have(name):
+        pkg = "mlx-vlm" if name == VLM_SERVER else "mlx-lm"
+        err(f"{name} not found — needed to serve [bold]{model}[/].")
+        console.print(f"  [dim]Install it with [cyan]uv tool install {pkg}[/] (or re-run "
+                      "[cyan]./mlx-pi setup[/]), then open a new terminal.[/]")
         sys.exit(1)
 
 def trim_log() -> None:
@@ -633,18 +688,26 @@ def cmd_setup(args) -> None:
     chip = sysctl("machdep.cpu.brand_string") or "Apple Silicon"
     ok(f"Running on [bold]{chip}[/] with [bold]{ram_gb()} GB[/] unified memory")
 
-    # --- 2. mlx-lm (global uv tool) ---------------------------------------
-    step("Step 2/6 · Installing mlx-lm globally (uv tool)")
+    # --- 2. mlx-lm + mlx-vlm (global uv tools) ----------------------------
+    step("Step 2/6 · Installing the MLX server backends (uv tools)")
     if not have("uv"):
         err("uv not found. Run ./bootstrap.sh first.")
         sys.exit(1)
-    # `uv tool install` = isolated env, but CLIs exposed globally on PATH.
+    # Two backends, isolated envs, CLIs exposed globally on PATH:
+    #   mlx-lm  (Apple's ml-explore) — text-only LLMs → mlx_lm.server
+    #   mlx-vlm (community Blaizzy/mlx-vlm) — vision models → mlx_vlm.server,
+    #           the only backend that accepts image input.
     # --upgrade makes this idempotent (installs or updates a single global copy).
     run(["uv", "tool", "install", "--upgrade", "mlx-lm"])
     if have("mlx_lm.server"):
-        ok("mlx-lm ready — mlx_lm.server / generate / chat are on PATH")
+        ok("mlx-lm ready — mlx_lm.server / generate / chat are on PATH (text models)")
     else:
         warn("mlx-lm installed but not yet on PATH — open a new terminal (or run 'uv tool update-shell').")
+    run(["uv", "tool", "install", "--upgrade", "mlx-vlm"])
+    if have("mlx_vlm.server"):
+        ok("mlx-vlm ready — mlx_vlm.server / generate on PATH (vision models, e.g. Gemma)")
+    else:
+        warn("mlx-vlm installed but not yet on PATH — open a new terminal (or run 'uv tool update-shell').")
 
     # --- 3. Node + pi -----------------------------------------------------
     step("Step 3/6 · Installing Node.js + pi harness")
@@ -670,10 +733,16 @@ def cmd_setup(args) -> None:
     step("Step 5/6 · Model download")
     if args.prefetch:
         if confirm_download(model, args.yes):
-            info(f"Downloading & warming {model} …")
-            run([server_bin().replace("mlx_lm.server", "mlx_lm.generate"),
-                 "--model", model, "--prompt", "Say ok.", "--max-tokens", "1"])
-            ok("Model downloaded and verified.")
+            if is_vision_model(model):
+                # A vision warm-up needs an image; just download the weights.
+                info(f"Downloading {model} (vision model) …")
+                _hf_download(model)
+                ok("Model downloaded.")
+            else:
+                info(f"Downloading & warming {model} …")
+                run([generate_bin(model),
+                     "--model", model, "--prompt", "Say ok.", "--max-tokens", "1"])
+                ok("Model downloaded and verified.")
         else:
             warn("Download skipped — the server will fetch it on first 'up'.")
     else:
@@ -711,7 +780,7 @@ def _print_setup_summary(model: str, linked: bool = True) -> None:
         console.print("  [yellow]Stick to ~3–4B 4-bit models.[/]")
     console.print("\n[bold]Optional — run at login:[/] generate a launchd file with "
                   "[cyan]./mlx-pi plist[/] (it won't install it; see the HTML guide).")
-    console.print("[dim]If 'mlx_lm.server' or 'pi' aren't found, open a NEW terminal so PATH refreshes.[/]")
+    console.print("[dim]If 'mlx_lm.server', 'mlx_vlm.server' or 'pi' aren't found, open a NEW terminal so PATH refreshes.[/]")
 
 
 # ============================================================================
@@ -719,8 +788,8 @@ def _print_setup_summary(model: str, linked: bool = True) -> None:
 # ============================================================================
 
 def cmd_up(args) -> bool:
-    require_mlx()
     model = resolve_model(args)
+    require_backend(model)
     host, port = args.host, args.port
 
     pid = server_pid()
@@ -730,15 +799,23 @@ def cmd_up(args) -> bool:
         # If the user explicitly asked for a different model than the one running,
         # honor it: restart onto it instead of just warning. (A bare `up` with no
         # model request leaves the running server alone — no surprise reload.)
-        switch = bool(_model_requested(args) and served and served != model)
+        model_switch = bool(_model_requested(args) and served and served != model)
+        # Same model but wrong backend (e.g. a text server on a vision model, so
+        # images would fail) is always wrong — fix it regardless of who asked.
+        backend_wrong = bool(served == model
+                             and server_backend(pid) not in (None, backend_name(model)))
+        switch = model_switch or backend_wrong
         if healthy and not switch:
             ok(f"MLX server is already up & healthy 🟢  →  http://{host}:{port}")
             if served:
                 info(f"Currently serving: [bold]{served}[/]")
             return True
-        if switch:
+        if model_switch:
             info(f"Server is serving [bold]{served}[/], but you asked for "
                  f"[bold]{model}[/] — restarting onto it.")
+        elif backend_wrong:
+            info(f"Server is running [bold]{model}[/] on the wrong backend for it "
+                 f"(needs {backend_name(model)}) — restarting onto the right one.")
         else:
             warn("Server process exists but isn't answering — restarting it.")
         cmd_down(args)
@@ -749,15 +826,18 @@ def cmd_up(args) -> bool:
 
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     trim_log()
+    bin_path = server_bin(model)
+    kind = "vision (mlx_vlm.server)" if is_vision_model(model) else "text (mlx_lm.server)"
     info("Starting MLX server (background daemon)…")
     info(f"  model: [bold]{model}[/]   bind: [bold]{host}:{port}[/]")
+    info(f"  backend: [bold]{kind}[/]")
     info(f"  log  : {LOG_FILE}")
 
     # Launch detached: start_new_session puts it in its own process group so it
     # survives this CLI exiting; output is appended to the log file.
     logf = open(LOG_FILE, "a")
     proc = subprocess.Popen(
-        [server_bin(), "--model", model, "--host", host,
+        [bin_path, "--model", model, "--host", host,
          "--port", str(port), "--max-tokens", str(DEFAULT_MAX_TOKENS)],
         stdout=logf, stderr=subprocess.STDOUT, start_new_session=True,
     )
@@ -815,8 +895,8 @@ def cmd_use(args) -> None:
     """Switch the served model AND pi's default together — the one command that
     keeps the two in sync. Downloads the model if needed, restarts the server on
     it, then points pi's default at that same model (only it, if pinned)."""
-    require_mlx()
     model = resolve_target_model(args)   # positional REPO_ID wins, else flags
+    require_backend(model)
     args.model = model                   # lock subsequent resolve_model() to it
     if getattr(args, "pin", False):
         os.environ["MLX_PIN_MODEL"] = "1"
@@ -858,6 +938,11 @@ def cmd_status(args) -> None:
     served = served_model(pid) if pid else None
     if served:
         t.add_row("model (preloaded)", served)
+    backend = server_backend(pid) if pid else None
+    if backend:
+        label = "vision · mlx_vlm.server (images ✅)" if backend == "vlm" \
+            else "text · mlx_lm.server (text only)"
+        t.add_row("backend", label)
     pi_default = configured_model_id()
     if pi_default:
         t.add_row("pi default model", pi_default)
@@ -873,7 +958,7 @@ def cmd_status(args) -> None:
     elif pid and not healthy:
         info("Process is up but not answering yet — likely still loading/downloading "
              "the model (watch './mlx-pi logs').")
-    # Sync check: pi requests a model by name and mlx_lm.server hot-swaps to it,
+    # Sync check: pi requests a model by name and the server hot-swaps to it,
     # so the launched (preloaded) model is only a default. We can't observe the
     # currently-resident model (the server doesn't expose or log it), but we CAN
     # flag when pi's default differs from what was preloaded — that first request
@@ -898,13 +983,15 @@ def cmd_logs(args) -> None:
 
 def cmd_run(args) -> None:
     """Foreground server (blocks). Good for debugging."""
-    require_mlx()
     model = resolve_model(args)
+    require_backend(model)
     if not confirm_download(model, args.yes):
         warn("Not starting server.")
         return
-    info(f"Running MLX server in the FOREGROUND (Ctrl-C to stop): {model}")
-    os.execvp(server_bin(), [server_bin(), "--model", model,
+    kind = "vision (mlx_vlm.server)" if is_vision_model(model) else "text (mlx_lm.server)"
+    info(f"Running MLX server in the FOREGROUND (Ctrl-C to stop): {model} — {kind}")
+    bin_path = server_bin(model)
+    os.execvp(bin_path, [bin_path, "--model", model,
               "--host", args.host, "--port", str(args.port),
               "--max-tokens", str(DEFAULT_MAX_TOKENS)])
 
@@ -1100,7 +1187,10 @@ PLIST_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
       cp com.mlx-pi.server.plist ~/Library/LaunchAgents/
       launchctl load   ~/Library/LaunchAgents/com.mlx-pi.server.plist   # enable
       launchctl unload ~/Library/LaunchAgents/com.mlx-pi.server.plist   # disable
-  Edit --model / --port below if you want different values.
+  Edit --model / --port below if you want different values. NOTE: the binary
+  above is backend-specific — mlx_vlm.server for vision models, mlx_lm.server
+  for text. If you change --model to a different backend, regenerate this file
+  with `mlx-pi plist --model <id>` so the binary matches.
 -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -1154,7 +1244,7 @@ def cmd_plist(args) -> None:
     )
 
     content = PLIST_TEMPLATE.format(
-        server_bin=server_bin(),
+        server_bin=server_bin(model),
         model=model,
         host=args.host,
         port=args.port,
@@ -1286,7 +1376,7 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"port (default {DEFAULT_PORT})")
         sp.add_argument("-y", "--yes", action="store_true", help="skip the download-size prompt")
 
-    sp = sub.add_parser("setup", help="install mlx-lm + pi and configure everything")
+    sp = sub.add_parser("setup", help="install mlx-lm + mlx-vlm + pi and configure everything")
     add_model_flags(sp); server_opts(sp)
     sp.add_argument("-p", "--prefetch", action="store_true", help="download the model now (with size check)")
     sp.add_argument("--no-link", action="store_true", help="don't symlink mlx-pi onto your PATH")
@@ -1368,7 +1458,7 @@ def print_overview() -> None:
     """Friendly branded help shown when `mlx-pi` is run with no subcommand."""
     console.print("\n[bold cyan]🍎 mlx-pi[/] — run local LLMs on Apple Silicon with MLX + the pi agent.\n")
     console.print("[bold]Typical flow:[/]")
-    console.print("  [cyan]mlx-pi setup[/]   one-time: install mlx-lm + pi, configure, make 'mlx-pi' global")
+    console.print("  [cyan]mlx-pi setup[/]   one-time: install mlx-lm + mlx-vlm + pi, configure, make 'mlx-pi' global")
     console.print("  [cyan]mlx-pi up[/]      start the local model server (background)")
     console.print("  [cyan]mlx-pi pi[/]      launch the coding agent against it")
     console.print("  [cyan]mlx-pi down[/]    stop the server, free your RAM\n")
@@ -1394,7 +1484,7 @@ def print_overview() -> None:
             ("models doctor", "clean + sync in one step (tidy & re-align)"),
         ]),
         ("Agent & install", [
-            ("setup", "install mlx-lm + pi, configure, symlink mlx-pi onto PATH"),
+            ("setup", "install mlx-lm + mlx-vlm + pi, configure, symlink mlx-pi onto PATH"),
             ("pi", "ensure the server is up, then launch the pi agent"),
             ("install", "symlink mlx-pi onto your PATH (global command)"),
             ("uninstall", "remove that symlink"),

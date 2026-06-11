@@ -10,7 +10,7 @@ Run LLMs **locally** on Apple Silicon (M-series) with [MLX](https://github.com/m
 
 ```bash
 ./bootstrap.sh        # 1. once: installs uv (the only prerequisite)
-./mlx-pi setup        # 2. installs mlx-lm + pi, configures everything
+./mlx-pi setup        # 2. installs mlx-lm + mlx-vlm + pi, configures everything
 ./mlx-pi up           # 3. starts the local model server (background)
 ./mlx-pi pi           # 4. launches the coding agent against it
 ```
@@ -49,8 +49,10 @@ You ──run──▶ ./mlx-pi pi ──HTTP /v1/chat/completions──▶ MLX 
                   └── reads ~/.pi/agent/models.json                        memory (GPU)
 ```
 
-- **`./mlx-pi setup`** installs **mlx-lm** globally (via `uv tool install`, so the `mlx_lm.*` commands work from any folder) and **pi** (via npm), then writes a `local-mlx` provider into `~/.pi/agent/models.json` pointing at `http://localhost:8080/v1`.
-- **`./mlx-pi up`** runs `mlx_lm.server` as a **background daemon** that loads your model into memory and exposes an OpenAI-compatible API. It's the only long-running process.
+- **`./mlx-pi setup`** installs two MLX server backends globally (via `uv tool install`, so their CLIs work from any folder) and **pi** (via npm), then writes a `local-mlx` provider into `~/.pi/agent/models.json` pointing at `http://localhost:8080/v1`:
+  - **mlx-lm** (Apple's [ml-explore](https://github.com/ml-explore/mlx-lm)) — runs **text-only** LLMs via `mlx_lm.server`.
+  - **mlx-vlm** (community [Blaizzy/mlx-vlm](https://github.com/Blaizzy/mlx-vlm)) — runs **vision** models (text **+ images**) via `mlx_vlm.server`. It's the only backend that accepts image input.
+- **`./mlx-pi up`** runs the **right backend for your model** as a background daemon — `mlx_vlm.server` for a vision model like Gemma, `mlx_lm.server` for a text model like Qwen — loading it into memory behind one OpenAI-compatible API. Both speak the same `/v1` endpoints, so pi (and `up`/`status`/`use`) treat them identically; `mlx-pi` just picks the binary. It's the only long-running process.
 - **pi** sends prompts to that local endpoint instead of the cloud, and runs its Read/Write/Edit/Bash tools locally on your machine.
 
 ---
@@ -58,7 +60,7 @@ You ──run──▶ ./mlx-pi pi ──HTTP /v1/chat/completions──▶ MLX 
 ## Commands
 
 ```text
-./mlx-pi setup      Install mlx-lm + pi, point pi at the local server, and symlink mlx-pi onto your PATH (--no-link to skip).
+./mlx-pi setup      Install mlx-lm + mlx-vlm + pi, point pi at the local server, and symlink mlx-pi onto your PATH (--no-link to skip).
 ./mlx-pi up         Start the MLX server in the background; wait until healthy.
 ./mlx-pi down       Stop the background server.
 ./mlx-pi restart    down + up.
@@ -93,6 +95,8 @@ Run `./mlx-pi <command> --help` for the flags on any subcommand.
 | `--gemma` | `mlx-community/gemma-4-26b-a4b-it-4bit` (text+image) | ~15.6 GB / ~32 GB |
 | `--model <id>` | any MLX repo from Hugging Face | varies |
 
+`--gemma` is a **vision** model — `mlx-pi` serves it on the `mlx_vlm.server` backend so you can paste images into pi; text models use Apple's `mlx_lm.server`. See [Text vs vision backends](#text-vs-vision-backends-images).
+
 Examples:
 
 ```bash
@@ -123,15 +127,35 @@ pi can use **every model you've downloaded**, not just the one from `setup`. The
 
 `models doctor` is the "just make everything tidy and aligned" button — it runs `clean` then `sync` in one go. The model you passed to `setup` (or the existing default) stays pi's **default**; the rest are selectable via `/model`. Restart pi — or use `/model` — to pick up changes made while it's running. In `./mlx-pi models`, the `pi` column shows `▸` for pi's default and `✓` for the other models pi can use.
 
+### Text vs vision backends (images)
+
+Some models are **vision** models — they accept images, not just text (e.g. **Gemma 4**). These need a different server: `mlx_lm.server` is text-only and rejects images with *"Only 'text' content type is supported"*. So `mlx-pi` runs each model on the **right backend automatically**:
+
+| Model kind | Backend | Package | Images? |
+|---|---|---|---|
+| Text LLMs (Qwen, Qwen-Coder, …) | `mlx_lm.server` | mlx-lm (Apple) | ❌ |
+| Vision models (Gemma 4, *-VL, LLaVA, …) | `mlx_vlm.server` | mlx-vlm (community) | ✅ |
+
+You don't choose the backend — `mlx-pi up --gemma` launches `mlx_vlm.server`, `mlx-pi up --qwen-coder` launches `mlx_lm.server`. The same model's image capability is advertised to pi to match, so pi only offers image paste when the backend can actually handle it. `./mlx-pi status` shows which backend is live (`backend  vision · mlx_vlm.server (images ✅)`), and `./mlx-pi models` lists each model's modality.
+
+Detection is a **name heuristic** (Gemma 4, `*-VL`, `llava`, `pixtral`, `idefics`, `moondream`, `smolvlm`, anything with `vision`). If a model is misclassified, override it:
+
+```bash
+export MLX_VISION_MODELS=org/my-vlm-with-an-odd-name   # force vision backend
+export MLX_TEXT_MODELS=org/not-actually-vision         # force text backend
+```
+
+> **Note:** `mlx-vlm` is a well-regarded *community* package (not Apple-maintained, unlike `mlx-lm`/`mlx`). Text generation runs on the same MLX kernels, so speed is comparable; sending an image adds a one-time vision-encode cost on that request. Your text models are untouched — they keep running on Apple's `mlx_lm.server`.
+
 ### Keeping the server and pi in sync
 
-The MLX server is launched with **one** model (its `--model`), but that's only a *preload/default*: `mlx_lm.server` **hot-swaps to whatever model a request names**. So when you `/model` to a different model inside pi, the server reloads that model on the fly. You won't get the wrong weights — but the swap costs a reload (seconds for small models, much longer for big ones) and the new model's RAM. The drift to watch for is *operational*, not correctness.
+The MLX server is launched with **one** model (its `--model`), but that's only a *preload/default*: the server **hot-swaps to whatever model a request names** (within the same backend). So when you `/model` to a different model inside pi, the server reloads that model on the fly. You won't get the wrong weights — but the swap costs a reload (seconds for small models, much longer for big ones) and the new model's RAM. The drift to watch for is *operational*, not correctness.
 
 There are two separate things to keep aligned: which model the **server preloaded** (its `--model`) and which model **pi opens on**. pi's startup model lives in `~/.pi/agent/settings.json` (`defaultProvider` + `defaultModel`) — **not** in the order of the `models.json` list — so changing it means writing that file, which `setup`, `use`, and `pi --<model>` do for you.
 
 - **`./mlx-pi up --<model>` / `pi --<model>`** — when an explicit model differs from the one a running server has, they **restart the server onto it** instead of just warning (a bare `up` leaves the running server alone). `pi --<model>` additionally sets pi's `defaultModel`, so the server and pi open on the same model.
 - **`./mlx-pi use <model>`** moves both sides together *without launching pi*: downloads if needed, restarts the server on it, and sets it as pi's `defaultModel`. The deliberate "switch everything to this model" command.
-- **`./mlx-pi status`** shows the **preloaded** model and **pi's default** side by side, and warns when they differ (pi's first request would force a reload). It can't show the *currently-resident* model after a swap — `mlx_lm.server` neither exposes nor logs it.
+- **`./mlx-pi status`** shows the **preloaded** model, the **backend** serving it, and **pi's default** side by side, and warns when the model and pi's default differ (pi's first request would force a reload). It can't show the *currently-resident* model after a swap — the server neither exposes nor logs it.
 - **Pinned mode** (`--pin` on `setup`/`use`, or `export MLX_PIN_MODEL=1`) registers **only** the served model with pi, so pi's picker can't drift to something that triggers a surprise reload. Good default on low-RAM machines.
 - **RAM guard** (on by default) hides models from pi's picker that clearly won't fit in your installed RAM, so selecting one can't OOM the box. The model you explicitly chose is always kept, and hidden models are reported (not silently dropped). Disable with `export MLX_NO_RAM_GUARD=1`.
 
@@ -190,6 +214,8 @@ All optional — sensible defaults otherwise.
 | `MLX_MODEL` | Default model id when no `--model`/preset flag is given (persists your choice across `up`/`pi`/`setup`). |
 | `MLX_PIN_MODEL` | `1` to register **only** the served model with pi (no hot-swap drift); same as `--pin`. |
 | `MLX_NO_RAM_GUARD` | `1` to register models even if they likely exceed installed RAM (the guard is on by default). |
+| `MLX_VISION_MODELS` | Comma-separated repo ids to force onto the **vision** backend (`mlx_vlm.server`) when the name heuristic misses. |
+| `MLX_TEXT_MODELS` | Comma-separated repo ids to force onto the **text** backend (`mlx_lm.server`), overriding vision detection. |
 | `MLX_STATE_DIR` | Where the PID file and server log live (default `~/.mlx-pi`). |
 | `MLX_LOG_MAX_BYTES` | Cap for `server.log` before it's trimmed (default `10485760` = 10 MB). |
 | `MLX_STARTUP_TIMEOUT` | Seconds `up` waits for the server to become healthy before giving up (default `600`). |

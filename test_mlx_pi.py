@@ -86,10 +86,35 @@ def size_formats():
     assert m._size(2 * 1024 ** 3) == "2.0 GB"
 
 @test
-def multimodal_detection():
-    assert m._pi_multimodal(m.GEMMA_MODEL) is True
-    assert m._pi_multimodal("mlx-community/Qwen2-VL-7B-4bit") is True
-    assert m._pi_multimodal(m.DEFAULT_MODEL) is False
+def vision_model_detection():
+    os.environ.pop("MLX_VISION_MODELS", None); os.environ.pop("MLX_TEXT_MODELS", None)
+    assert m.is_vision_model(m.GEMMA_MODEL) is True
+    assert m.is_vision_model("mlx-community/Qwen2-VL-7B-4bit") is True
+    assert m.is_vision_model("mlx-community/llava-1.5-7b-4bit") is True
+    assert m.is_vision_model(m.DEFAULT_MODEL) is False
+    assert m.is_vision_model(m.QWEN_CODER_MODEL) is False
+
+@test
+def vision_detection_env_overrides():
+    try:
+        os.environ["MLX_VISION_MODELS"] = "org/secretly-vision, org/another"
+        assert m.is_vision_model("org/secretly-vision") is True
+        os.environ["MLX_TEXT_MODELS"] = m.GEMMA_MODEL   # force a known VLM to text
+        assert m.is_vision_model(m.GEMMA_MODEL) is False
+    finally:
+        os.environ.pop("MLX_VISION_MODELS", None); os.environ.pop("MLX_TEXT_MODELS", None)
+
+@test
+def backend_selection():
+    os.environ.pop("MLX_VISION_MODELS", None); os.environ.pop("MLX_TEXT_MODELS", None)
+    assert m.backend_name(m.GEMMA_MODEL) == m.VLM_SERVER
+    assert m.backend_name(m.DEFAULT_MODEL) == m.LM_SERVER
+    # server_bin() resolves to the right binary basename per model
+    assert m.server_bin(m.GEMMA_MODEL).endswith("mlx_vlm.server")
+    assert m.server_bin(m.DEFAULT_MODEL).endswith("mlx_lm.server")
+    assert m.server_bin().endswith("mlx_lm.server")   # no model → text default
+    assert m.generate_bin(m.GEMMA_MODEL).endswith("mlx_vlm.generate")
+    assert m.generate_bin(m.DEFAULT_MODEL).endswith("mlx_lm.generate")
 
 @test
 def resolve_model_precedence():
