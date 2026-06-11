@@ -675,7 +675,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="mlx-pi",
         description="Run local LLMs on Apple Silicon with MLX + the pi agent.",
     )
-    sub = p.add_subparsers(dest="cmd", required=True)
+    sub = p.add_subparsers(dest="cmd")
 
     def server_opts(sp):
         sp.add_argument("--host", default=DEFAULT_HOST, help=f"bind address (default {DEFAULT_HOST})")
@@ -726,8 +726,51 @@ def build_parser() -> argparse.ArgumentParser:
 
     return p
 
+def print_overview() -> None:
+    """Friendly branded help shown when `mlx-pi` is run with no subcommand."""
+    console.print("\n[bold cyan]🍎 mlx-pi[/] — run local LLMs on Apple Silicon with MLX + the pi agent.\n")
+    console.print("[bold]Typical flow:[/]")
+    console.print("  [cyan]mlx-pi setup[/]   one-time: install mlx-lm + pi, configure, make 'mlx-pi' global")
+    console.print("  [cyan]mlx-pi up[/]      start the local model server (background)")
+    console.print("  [cyan]mlx-pi pi[/]      launch the coding agent against it")
+    console.print("  [cyan]mlx-pi down[/]    stop the server, free your RAM\n")
+
+    groups = [
+        ("Server lifecycle", [
+            ("up", "start the MLX server in the background; wait until healthy"),
+            ("down", "stop the background server"),
+            ("restart", "down + up"),
+            ("run", "run the server in the FOREGROUND (Ctrl-C to stop)"),
+        ]),
+        ("Inspect", [
+            ("status", "show running state + health"),
+            ("logs", "tail the server log"),
+        ]),
+        ("Agent & install", [
+            ("setup", "install mlx-lm + pi, configure, symlink mlx-pi onto PATH"),
+            ("pi", "ensure the server is up, then launch the pi agent"),
+            ("install", "symlink mlx-pi onto your PATH (global command)"),
+            ("uninstall", "remove that symlink"),
+            ("plist", "generate a launchd plist for auto-start (does not install)"),
+        ]),
+    ]
+    for title, rows in groups:
+        t = Table(show_header=False, box=None, pad_edge=False)
+        t.add_column(style="cyan", no_wrap=True)
+        t.add_column(style="white")
+        for name, desc in rows:
+            t.add_row(f"mlx-pi {name}", desc)
+        console.print(f"[bold]{title}[/]")
+        console.print(t)
+        console.print()
+    console.print("[dim]Flags for any command:[/] [cyan]mlx-pi <command> --help[/]")
+    console.print("[dim]Full illustrated guide:[/] https://curtisalexander.github.io/mlx-pi/\n")
+
 def main() -> None:
     args = build_parser().parse_args()
+    if not getattr(args, "func", None):
+        print_overview()
+        return
     try:
         args.func(args)
     except KeyboardInterrupt:
