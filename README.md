@@ -2,7 +2,7 @@
 
 Run LLMs **locally** on Apple Silicon (M-series) with [MLX](https://github.com/ml-explore/mlx) as the inference engine and [pi](https://github.com/earendil-works/pi) as the coding agent. No cloud, no API keys, no token costs — once a model is downloaded you can run fully offline.
 
-> 📖 For the full illustrated walkthrough (architecture diagrams, how to read a Hugging Face model card, quantization, launchd, troubleshooting), open **[`mlx-pi-guide.html`](./mlx-pi-guide.html)** in a browser.
+> 📖 For the full illustrated walkthrough (architecture diagrams, how to read a Hugging Face model card, quantization, launchd, troubleshooting), read the **[online guide](https://curtisalexander.github.io/mlx-pi/)** — or open the source [`mlx-pi-guide.html`](./mlx-pi-guide.html) in a browser.
 
 ---
 
