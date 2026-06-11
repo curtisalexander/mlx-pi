@@ -92,7 +92,17 @@ LOG_MAX_BYTES = int(os.environ.get("MLX_LOG_MAX_BYTES", 10 * 1024 * 1024))  # 10
 # npm package for the pi coding agent (latest recommended install).
 PI_NPM_PKG = "@earendil-works/pi-coding-agent"
 
-HF_CACHE = Path.home() / ".cache" / "huggingface" / "hub"
+def _hf_cache_dir() -> Path:
+    """Resolve the HF hub cache the same way huggingface_hub does, so we look
+    where models are actually stored when HF_HOME / HF_HUB_CACHE are customized."""
+    if os.environ.get("HF_HUB_CACHE"):
+        return Path(os.environ["HF_HUB_CACHE"])
+    if os.environ.get("HF_HOME"):
+        return Path(os.environ["HF_HOME"]) / "hub"
+    base = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
+    return base / "huggingface" / "hub"
+
+HF_CACHE = _hf_cache_dir()
 
 
 # ============================================================================
@@ -256,7 +266,8 @@ def served_model(pid: int) -> str | None:
     /v1/models endpoint lists every cached model (mlx_lm can hot-swap per
     request), so it can't tell us the loaded one — the process args can."""
     try:
-        out = subprocess.check_output(["ps", "-p", str(pid), "-o", "command="], text=True)
+        # -ww: don't truncate the command line to terminal width.
+        out = subprocess.check_output(["ps", "-ww", "-p", str(pid), "-o", "command="], text=True)
     except Exception:
         return None
     parts = out.split()
@@ -403,6 +414,10 @@ def configure_pi(model: str, base_url: str) -> None:
         backup = PI_CONFIG_FILE.with_suffix(f".json.bak.{int(time.time())}")
         backup.write_text(PI_CONFIG_FILE.read_text())
         info(f"Existing config backed up → {backup.name}")
+        # Keep only the 5 most recent backups so they don't pile up over time.
+        old = sorted(PI_CONFIG_DIR.glob("models.json.bak.*"))[:-5]
+        for f in old:
+            f.unlink(missing_ok=True)
         try:
             data = json.loads(PI_CONFIG_FILE.read_text())
         except Exception:
@@ -504,8 +519,12 @@ def cmd_up(args) -> bool:
     PID_FILE.write_text(str(proc.pid))
     info(f"PID {proc.pid} — waiting for it to become healthy…")
 
-    # Poll health. First run may download the model, so wait generously.
-    for i in range(600):  # ~10 min
+    # Poll health on a real clock (is_healthy can block up to its timeout, so a
+    # plain loop counter would drift). First run may download the model, so wait
+    # generously (override with MLX_STARTUP_TIMEOUT seconds).
+    timeout = int(os.environ.get("MLX_STARTUP_TIMEOUT", 600))
+    start = time.monotonic()
+    while time.monotonic() - start < timeout:
         if proc.poll() is not None:
             err("Server process died during startup. Last log lines:")
             _tail(LOG_FILE, 20)
@@ -514,9 +533,9 @@ def cmd_up(args) -> bool:
             console.print()
             ok(f"MLX server is UP and HEALTHY 🟢  →  http://{host}:{port}")
             return True
-        console.print(f"  [dim]…still warming up ({i}s)[/]", end="\r")
+        console.print(f"  [dim]…still warming up ({int(time.monotonic() - start)}s)[/]", end="\r")
         time.sleep(1)
-    err("Server did not become healthy in time. Check: ./mlx-pi logs")
+    err(f"Server did not become healthy within {timeout}s. Check: ./mlx-pi logs")
     return False
 
 def cmd_down(args) -> None:
@@ -814,6 +833,15 @@ def trim_log() -> None:
             f.write(tail)
     except OSError:
         pass
+
+def _tail(path: Path, n: int) -> None:
+    """Print the last n lines of a file (best-effort, for error context)."""
+    try:
+        lines = path.read_text(errors="replace").splitlines()
+    except OSError:
+        return
+    for line in lines[-n:]:
+        console.print(f"  [dim]{line}[/]")
 
 def cmd_logs(args) -> None:
     if not LOG_FILE.exists():
