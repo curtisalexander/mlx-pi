@@ -105,6 +105,19 @@ Examples:
 
 Run **`./mlx-pi models`** any time to see the presets, which are downloaded (with on-disk size — partial/interrupted downloads are flagged as `⏳ partial`), and which one pi is currently configured to call. Use **`./mlx-pi models pull [flags]`** to download one ahead of time (resumes partials) and **`./mlx-pi models rm [flags]`** to delete one and reclaim disk.
 
+### Hugging Face authentication (`HF_TOKEN`)
+
+Set a [Hugging Face token](https://huggingface.co/settings/tokens) if you hit **gated models** (you must accept the model's license first) or want **higher download rate limits** (anonymous downloads can be throttled — a common cause of slow pulls):
+
+```bash
+export HF_TOKEN=hf_xxxxx        # bash/zsh — add to your shell rc to persist
+set -Ux HF_TOKEN hf_xxxxx       # fish (universal, persists)
+```
+
+`models pull`, `up`, and `pi` all run their downloads as child processes that inherit your environment, so `HF_TOKEN` is picked up automatically — no flag needed. (A token saved via `hf auth login` works too.)
+
+> ⚠️ The **launchd** auto-start server (`./mlx-pi plist`) runs with a minimal environment and does **not** see `HF_TOKEN`. If you auto-start *and* use a gated model, set the token in the plist (or pre-download with `./mlx-pi models pull` while authenticated).
+
 > 💡 Want the MLX format. Look for repos under `mlx-community` (or `lmstudio-community` …-MLX-…). Avoid `.gguf` files — those are for llama.cpp/Ollama, not `mlx_lm`. See guide §2 for how to read model names, quantization (`4bit`/`8bit`/`bf16`), and `A3B`/`A4B` MoE "active params".
 
 ---
@@ -134,6 +147,7 @@ launchctl unload ~/Library/LaunchAgents/com.mlx-pi.server.plist  # disable later
 | pi hangs on first message | Server is still downloading the model — watch `./mlx-pi logs`. |
 | Out of memory / sluggish | Model too big for your RAM — use a smaller one and close heavy apps. |
 | Port already in use | `./mlx-pi up --port 8090` and re-run `./mlx-pi setup --port 8090`. |
+| Download very slow, or `401`/gated error | Set `HF_TOKEN` (see [Hugging Face authentication](#hugging-face-authentication-hf_token)) — auth raises rate limits and unlocks gated models. |
 
 ---
 
