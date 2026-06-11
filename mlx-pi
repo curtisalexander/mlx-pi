@@ -23,6 +23,8 @@
 #    run       Run the server in the FOREGROUND (Ctrl-C to stop).
 #    pi        Ensure the server is up, then launch the pi agent.
 #    plist     Generate a personalized launchd plist (does NOT install it).
+#    install   Symlink this script onto your PATH so `mlx-pi` works anywhere.
+#    uninstall Remove that symlink.
 #
 #  Try:  ./mlx-pi --help   or   ./mlx-pi <subcommand> --help
 # ============================================================================
@@ -591,6 +593,66 @@ def cmd_plist(args) -> None:
 
 
 # ============================================================================
+#  SUBCOMMAND: install / uninstall  (symlink this script onto your PATH)
+# ============================================================================
+#
+# This is a single-file `uv run --script`, not a package, so `uv tool install`
+# (which installs entry points from a Python package) doesn't apply. The
+# idiomatic global install for a self-contained uv script is a symlink onto
+# PATH; `uv run` in the shebang keeps deps managed. The symlink points back at
+# the repo, so `git pull` updates the global command automatically.
+
+def _on_path(d: Path) -> bool:
+    entries = os.environ.get("PATH", "").split(os.pathsep)
+    return str(d) in entries
+
+def cmd_install(args) -> None:
+    src = Path(__file__).resolve()
+    dest_dir = Path(args.dir).expanduser()
+    link = dest_dir / "mlx-pi"
+
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    if link.is_symlink():
+        if link.resolve() == src:
+            ok(f"Already installed: {link} → {src}")
+        elif args.force:
+            link.unlink(); link.symlink_to(src)
+            ok(f"Re-pointed {link} → {src}")
+        else:
+            err(f"{link} already links to {link.resolve()}. Use --force to repoint.")
+            return
+    elif link.exists():
+        err(f"{link} exists and is not a symlink — refusing to overwrite. "
+            "Move it aside or pass a different --dir.")
+        return
+    else:
+        link.symlink_to(src)
+        ok(f"Installed: {link} → {src}")
+
+    if _on_path(dest_dir):
+        info("You can now run [cyan]mlx-pi[/] from any directory.")
+    else:
+        warn(f"{dest_dir} is not on your PATH. Add it, e.g.:")
+        console.print(f"  [cyan]fish_add_path {dest_dir}[/]   "
+                      "[dim](fish)[/]")
+        console.print(f"  [cyan]export PATH=\"{dest_dir}:$PATH\"[/]   "
+                      "[dim](bash/zsh — add to your rc file)[/]")
+
+def cmd_uninstall(args) -> None:
+    link = Path(args.dir).expanduser() / "mlx-pi"
+    if not link.is_symlink():
+        if link.exists():
+            err(f"{link} is a real file, not our symlink — leaving it alone.")
+        else:
+            warn(f"Nothing to remove at {link}.")
+        return
+    target = link.resolve()
+    link.unlink()
+    ok(f"Removed symlink {link} (was → {target}).")
+
+
+# ============================================================================
 #  Argument parsing / dispatch
 # ============================================================================
 
@@ -636,6 +698,16 @@ def build_parser() -> argparse.ArgumentParser:
     add_model_flags(sp); server_opts(sp)
     sp.add_argument("-o", "--output", default="com.mlx-pi.server.plist", help="output path")
     sp.set_defaults(func=cmd_plist)
+
+    default_bin = str(Path.home() / ".local" / "bin")
+    sp = sub.add_parser("install", help="symlink mlx-pi onto your PATH (global command)")
+    sp.add_argument("-d", "--dir", default=default_bin, help=f"target bin dir (default {default_bin})")
+    sp.add_argument("-f", "--force", action="store_true", help="repoint an existing mlx-pi symlink")
+    sp.set_defaults(func=cmd_install)
+
+    sp = sub.add_parser("uninstall", help="remove the mlx-pi symlink from your PATH")
+    sp.add_argument("-d", "--dir", default=default_bin, help=f"target bin dir (default {default_bin})")
+    sp.set_defaults(func=cmd_uninstall)
 
     return p
 

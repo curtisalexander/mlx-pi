@@ -21,6 +21,8 @@ When you're done:
 ./mlx-pi down         # stop the server, free your RAM
 ```
 
+> 💡 Tired of the `./` prefix? Run `./mlx-pi install` to symlink it into `~/.local/bin`, then call `mlx-pi` from any directory. It points back at this repo, so `git pull` updates the global command automatically. Undo with `mlx-pi uninstall`. (It's a single-file `uv` script, so this symlink — not `uv tool install`, which needs a packaged project — is the right way to install it globally.)
+
 The default model is a small **Qwen3 4B** (~2 GB) so you can confirm the whole pipeline works in a couple of minutes before committing to anything bigger.
 
 ---
@@ -62,6 +64,8 @@ You ──run──▶ ./mlx-pi pi ──HTTP /v1/chat/completions──▶ MLX 
 ./mlx-pi run        Run the server in the FOREGROUND (Ctrl-C to stop).
 ./mlx-pi pi         Ensure the server is up, then launch the pi agent.
 ./mlx-pi plist      Generate a launchd plist for auto-start (does NOT install it).
+./mlx-pi install    Symlink mlx-pi into ~/.local/bin so `mlx-pi` works anywhere.
+./mlx-pi uninstall  Remove that symlink.
 ```
 
 Run `./mlx-pi <command> --help` for the flags on any subcommand.
