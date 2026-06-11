@@ -86,10 +86,14 @@ Run `./mlx-pi <command> --help` for the flags on any subcommand.
 Examples:
 
 ```bash
-./mlx-pi setup --qwen-coder      # configure pi for the coding model
-./mlx-pi up --qwen-coder         # serve it
+./mlx-pi setup --qwen-coder      # configure pi for the coding model (no download yet)
+./mlx-pi up --qwen-coder         # serve it — downloads on first run
 ./mlx-pi up --model mlx-community/Qwen3-4B-Instruct-2507-4bit
 ```
+
+> ⚠️ **`setup` configures; `up` downloads.** `setup --qwen-coder` only points pi at the model — it does **not** download the (multi-GB) weights. The download happens on the first `./mlx-pi up`. Two consequences:
+> - **Pass the same flag to both.** `up` does *not* inherit `setup`'s choice; run `./mlx-pi up --qwen-coder`, or it serves the default 4B and mismatches what pi calls. (Or persist it: `export MLX_MODEL=<id>`.)
+> - **Want the weights during setup?** Add `-p`/`--prefetch`: `./mlx-pi setup --qwen-coder -p`.
 
 **Before downloading anything**, the tool queries Hugging Face for the exact size, prints the download size + a rough RAM estimate, warns if it exceeds your memory, and asks you to confirm (default **No**). Add `-y`/`--yes` to skip the prompt. If the model is already cached, it proceeds silently.
 
