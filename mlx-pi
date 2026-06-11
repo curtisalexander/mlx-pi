@@ -475,7 +475,8 @@ def _print_setup_summary(model: str, linked: bool = True) -> None:
 
 
 # ============================================================================
-#  SUBCOMMAND: up / down / restart / status / logs / run / pi
+#  SUBCOMMANDS: server lifecycle — up / down / restart / status
+#  (logs / run / pi live further down, after the models helpers)
 # ============================================================================
 
 def cmd_up(args) -> bool:
@@ -579,6 +580,10 @@ def cmd_status(args) -> None:
     console.print("[bold]MLX server status[/]")
     console.print(t)
 
+# ============================================================================
+#  HF cache & model-state helpers (shared by `models` and pi config)
+# ============================================================================
+
 def cache_size_bytes(repo: str) -> int | None:
     """On-disk size of a cached model (sum of its blob files). None if absent."""
     blobs = HF_CACHE / f"models--{repo.replace('/', '--')}" / "blobs"
@@ -668,6 +673,10 @@ def _download_cell(repo: str) -> str:
     if s == "partial":
         return f"[yellow]⏳ partial ({_size(cache_size_bytes(repo))} so far)[/]"
     return "[dim]— not yet[/]"
+
+# ============================================================================
+#  SUBCOMMAND: models — list / pull / rm / clean / sync / doctor
+# ============================================================================
 
 def cmd_models(args) -> None:
     configured = configured_model_id()
@@ -812,6 +821,10 @@ def cmd_models_doctor(args) -> None:
     cmd_models_clean(args)
     step("2/2 · Aligning pi's model list with the cache")
     cmd_models_sync(args)
+
+# ============================================================================
+#  SUBCOMMANDS: logs / run / pi  (+ log-file helpers)
+# ============================================================================
 
 def trim_log() -> None:
     """Cap server.log: if it exceeds LOG_MAX_BYTES, keep only the most recent
@@ -1081,7 +1094,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_setup)
 
     sp = sub.add_parser("up", help="start the MLX server in the background")
-    add_model_flags(sp); server_opts(sp); sp.set_defaults(func=lambda a: cmd_up(a))
+    add_model_flags(sp); server_opts(sp); sp.set_defaults(func=cmd_up)
 
     sp = sub.add_parser("down", help="stop the background server")
     server_opts(sp); sp.set_defaults(func=cmd_down)
