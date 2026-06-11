@@ -578,12 +578,22 @@ def cmd_status(args) -> None:
     t.add_column(style="bold cyan")
     t.add_column()
     pid = server_pid()
+    healthy = is_healthy(host, port)
     t.add_row("endpoint", f"http://{host}:{port}")
     t.add_row("process", f"[green]running[/] (PID {pid})" if pid else "[red]not running[/]")
-    t.add_row("health", "[green]healthy 🟢[/]" if is_healthy(host, port) else "[red]not responding 🔴[/]")
+    t.add_row("health", "[green]healthy 🟢[/]" if healthy else "[red]not responding 🔴[/]")
+    if pid and (served := served_model(pid)):
+        t.add_row("model", served)
     t.add_row("log", str(LOG_FILE))
     console.print("[bold]MLX server status[/]")
     console.print(t)
+    # Surface the ambiguity when process-state and the port disagree.
+    if healthy and not pid:
+        warn(f"Something is answering on port {port}, but mlx-pi isn't tracking "
+             "a server it started — another process may be using this port.")
+    elif pid and not healthy:
+        info("Process is up but not answering yet — likely still loading/downloading "
+             "the model (watch './mlx-pi logs').")
 
 # ============================================================================
 #  HF cache & model-state helpers (shared by `models` and pi config)
