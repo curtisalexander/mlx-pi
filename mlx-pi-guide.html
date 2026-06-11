@@ -1,0 +1,532 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>MLX + pi on Apple Silicon (M5) — Local LLM Setup Guide</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+<style>
+  :root{
+    --bg:#0d1117; --panel:#161b22; --panel2:#1c2330; --ink:#e6edf3;
+    --muted:#9aa7b4; --line:#2a3340; --accent:#7c93ff; --accent2:#52e0c4;
+    --green:#3fb950; --yellow:#d8a73a; --red:#f85149; --apple:#f0f0f0;
+    --code:#0b0f15;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{
+    margin:0; background:linear-gradient(180deg,#0b0e13,#0d1117 240px);
+    color:var(--ink);
+    font:16px/1.65 -apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  }
+  .wrap{max-width:1060px;margin:0 auto;padding:0 22px 120px}
+  header.hero{
+    text-align:center;padding:64px 20px 40px;
+  }
+  header.hero .badge{
+    display:inline-block;font-size:13px;letter-spacing:.12em;text-transform:uppercase;
+    color:var(--accent2);border:1px solid var(--line);border-radius:999px;padding:6px 14px;margin-bottom:18px;
+  }
+  header.hero h1{font-size:40px;line-height:1.15;margin:.2em 0;font-weight:800;letter-spacing:-.02em}
+  header.hero h1 span{background:linear-gradient(90deg,var(--accent),var(--accent2));-webkit-background-clip:text;background-clip:text;color:transparent}
+  header.hero p.sub{color:var(--muted);font-size:18px;max-width:640px;margin:10px auto 0}
+  .toc{
+    display:flex;flex-wrap:wrap;gap:10px;justify-content:center;margin:28px 0 0;
+  }
+  .toc a{
+    color:var(--ink);text-decoration:none;background:var(--panel);border:1px solid var(--line);
+    padding:7px 13px;border-radius:8px;font-size:14px;transition:.15s;
+  }
+  .toc a:hover{border-color:var(--accent);color:#fff}
+  section{margin-top:54px}
+  h2{font-size:26px;margin:0 0 6px;letter-spacing:-.01em}
+  h2 .num{color:var(--accent);font-weight:800;margin-right:10px}
+  h3{font-size:19px;margin:26px 0 6px}
+  p{color:#d3dbe3}
+  .lead{color:var(--muted)}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:22px 24px;margin-top:16px}
+  .grid{display:grid;gap:16px}
+  .grid.two{grid-template-columns:1fr 1fr}
+  .grid.three{grid-template-columns:repeat(3,1fr)}
+  @media(max-width:820px){.grid.two,.grid.three{grid-template-columns:1fr}}
+  .pill{display:inline-block;font-size:12px;padding:3px 9px;border-radius:999px;border:1px solid var(--line);color:var(--muted);margin-right:6px}
+  .pill.daemon{color:#ffd9a0;border-color:#5a4424;background:#241a0e}
+  .pill.once{color:#bfe7c6;border-color:#244a2c;background:#0f1d13}
+  .pill.cli{color:#cfd6ff;border-color:#2c3470;background:#12152b}
+  code,kbd{font-family:"SF Mono",ui-monospace,Menlo,Consolas,monospace}
+  code.inline{background:var(--code);border:1px solid var(--line);border-radius:6px;padding:1px 6px;font-size:13.5px;color:#e9c0ff}
+  pre{background:var(--code);border:1px solid var(--line);border-radius:12px;padding:16px 18px;overflow:auto;font-size:13.5px;line-height:1.55}
+  pre code{color:#c9d4e0}
+  .tok-cmd{color:#7ee787}.tok-flag{color:#79c0ff}.tok-comment{color:#6e7a87;font-style:italic}.tok-str{color:#a5d6ff}
+  table{width:100%;border-collapse:collapse;margin-top:14px;font-size:14.5px}
+  th,td{text-align:left;padding:10px 12px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{color:var(--accent2);font-weight:600;font-size:13px;text-transform:uppercase;letter-spacing:.05em}
+  td code{color:#e9c0ff}
+  .mermaid{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:22px;margin-top:18px;text-align:center}
+  .note{border-left:3px solid var(--accent);background:var(--panel2);border-radius:0 10px 10px 0;padding:12px 16px;margin-top:14px;color:#cfe0f0}
+  .warnbox{border-left:3px solid var(--yellow);background:#1f1a0e;border-radius:0 10px 10px 0;padding:12px 16px;margin-top:14px;color:#f0e3c0}
+  .step-h{display:flex;align-items:center;gap:12px;margin-top:30px}
+  .step-h .dot{flex:0 0 34px;height:34px;border-radius:50%;display:grid;place-items:center;font-weight:800;background:linear-gradient(135deg,var(--accent),var(--accent2));color:#0b0e13}
+  .step-h h3{margin:0}
+  .kv{display:grid;grid-template-columns:150px 1fr;gap:6px 14px;margin-top:12px;font-size:14.5px}
+  .kv dt{color:var(--accent2);font-weight:600}
+  .kv dd{margin:0;color:#d3dbe3}
+  .legend{display:flex;gap:18px;flex-wrap:wrap;margin-top:10px;font-size:13px;color:var(--muted)}
+  .legend span{display:inline-flex;align-items:center;gap:7px}
+  .swatch{width:13px;height:13px;border-radius:3px;display:inline-block}
+  footer{margin-top:70px;padding-top:22px;border-top:1px solid var(--line);color:var(--muted);font-size:13.5px}
+  footer a{color:var(--accent)}
+  .onoff{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:8px}
+  .onoff .b{border:1px solid var(--line);border-radius:12px;padding:16px;background:var(--panel2)}
+  .onoff .b.on{border-color:#244a2c}.onoff .b.off{border-color:#4a2424}
+  .onoff h4{margin:0 0 8px;font-size:15px}
+  .emoji{font-size:18px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="hero">
+  <div class="badge">🍎 Apple Silicon · M5 · June 2026</div>
+  <h1>Run LLMs Locally with <span>MLX + pi</span></h1>
+  <p class="sub">Everything that gets downloaded, where it lives, what runs (and whether it’s a daemon), how to turn it on/off, and how <code class="inline">pi</code> talks to your model — end to end.</p>
+  <nav class="toc">
+    <a href="#bigpicture">Big picture</a>
+    <a href="#glossary">The pieces</a>
+    <a href="#models">Choosing a model</a>
+    <a href="#diagram">Architecture</a>
+    <a href="#steps">Step by step</a>
+    <a href="#sequence">What happens at runtime</a>
+    <a href="#onoff">On / Off</a>
+    <a href="#startup">Run at startup</a>
+    <a href="#pi">pi integration</a>
+    <a href="#cheat">Cheat sheet</a>
+    <a href="#trouble">Troubleshooting</a>
+  </nav>
+</header>
+
+<!-- ============================ BIG PICTURE ============================ -->
+<section id="bigpicture">
+  <h2><span class="num">0</span>The big picture in one breath</h2>
+  <p class="lead">You install <b>two</b> programs once, globally. Then for each session you start <b>one</b> background server and point your agent at it.</p>
+  <div class="card">
+    <div class="kv">
+      <dt>⓪ Bootstrap once</dt><dd>Run <code class="inline">./bootstrap.sh</code> to install <b>uv</b>. After that, one tool — <code class="inline">./mlx-pi</code> — does everything else.</dd>
+      <dt>① Install once</dt><dd><b>MLX</b> (the inference engine) + <b>pi</b> (the coding agent / harness). Done by <code class="inline">./mlx-pi setup</code>.</dd>
+      <dt>② Turn on</dt><dd>Start the <b>MLX server</b> — a local web server that loads your model and speaks the OpenAI API. Done by <code class="inline">./mlx-pi up</code>.</dd>
+      <dt>③ Use</dt><dd>Launch <b>pi</b>; it sends prompts to <code class="inline">http://localhost:8080/v1</code> instead of the cloud. Done by <code class="inline">./mlx-pi pi</code>.</dd>
+      <dt>④ Turn off</dt><dd>Stop the server to free your RAM. Done by <code class="inline">./mlx-pi down</code>.</dd>
+    </div>
+    <div class="note">💡 Nothing here phones home. Once a model is downloaded, you can run fully offline — no API keys, no token costs, no data leaving your Mac.</div>
+  </div>
+  <div class="card" style="margin-top:16px">
+    <h3 style="margin-top:0">🧩 Why two files (<code class="inline">bootstrap.sh</code> + <code class="inline">mlx-pi</code>)?</h3>
+    <p><b><code class="inline">bootstrap.sh</code></b> is a ~5-line shell script whose only job is to install <code class="inline">uv</code>. It must be shell because a fresh Mac ships neither uv nor a reliable <code class="inline">python3</code> — and bash is the one thing always present.</p>
+    <p><b><code class="inline">mlx-pi</code></b> is a single Python program that does everything else (setup, server control, config, Hugging Face size checks). Its first line — <code class="inline">#!/usr/bin/env -S uv run --script</code> — tells uv to run it, and an inline metadata block lists its dependencies (<code class="inline">rich</code>, <code class="inline">httpx</code>). uv builds that environment automatically on first run and caches it; there’s no virtualenv to manage. Native JSON, HTTP, and arg-parsing make it far easier to read and extend than shell.</p>
+  </div>
+</section>
+
+<!-- ============================ GLOSSARY ============================ -->
+<section id="glossary">
+  <h2><span class="num">1</span>The pieces — what each one <em>is</em></h2>
+  <p class="lead">Four moving parts. Two are tools you install; two are processes/files that exist at runtime.</p>
+
+  <div class="grid two">
+    <div class="card">
+      <span class="pill cli">install once</span>
+      <h3>🧰 uv</h3>
+      <p>A single fast binary that manages Python tools. We use it instead of <code class="inline">pip</code>. Crucially, <code class="inline">uv tool install</code> installs a command-line app into its own isolated environment but exposes it <b>globally</b> — so MLX works from every project without polluting any of them.</p>
+      <p class="lead">Lives at <code class="inline">~/.local/bin/uv</code>.</p>
+    </div>
+    <div class="card">
+      <span class="pill cli">install once</span>
+      <h3>⚙️ MLX / mlx-lm</h3>
+      <p><b>MLX</b> is Apple’s array framework, purpose-built for Apple-Silicon unified memory and the M5’s Metal-4 tensor accelerators. <b>mlx-lm</b> is the package on top that runs LLMs and ships the CLIs you’ll actually call: <code class="inline">mlx_lm.server</code>, <code class="inline">mlx_lm.generate</code>, <code class="inline">mlx_lm.chat</code>.</p>
+      <p class="lead">Installed by uv into <code class="inline">~/.local/share/uv/tools/mlx-lm</code>; commands symlinked into <code class="inline">~/.local/bin</code>.</p>
+    </div>
+    <div class="card">
+      <span class="pill cli">install once</span>
+      <h3>🤖 pi</h3>
+      <p>Mario Zechner’s bring-your-own-key coding agent (<code class="inline">@earendil-works/pi-coding-agent</code>). A minimal four-tool core — Read, Write, Edit, Bash — that talks to <em>any</em> OpenAI-compatible endpoint. That’s the hook we use to point it at MLX.</p>
+      <p class="lead">Installed via npm (needs Node). Config in <code class="inline">~/.pi/agent/models.json</code>.</p>
+    </div>
+    <div class="card">
+      <span class="pill daemon">runs in background</span>
+      <h3>🌐 The MLX server</h3>
+      <p>When you run <code class="inline">mlx_lm.server</code>, it loads your model into memory and listens on <code class="inline">http://localhost:8080</code>, exposing OpenAI-style routes (<code class="inline">/v1/chat/completions</code>, <code class="inline">/v1/models</code>). This is the <b>only long-running process</b>. It is a daemon you start and stop; it is <em>not</em> a system service and won’t auto-start on boot.</p>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:16px">
+    <span class="pill once">downloaded on demand</span>
+    <h3>📦 The model weights</h3>
+    <p>The actual neural-network file (e.g. <code class="inline">Qwen3-Coder-30B-A3B-Instruct-4bit</code>, several GB) is pulled from the Hugging Face <code class="inline">mlx-community</code> repo the first time it’s used, then cached forever.</p>
+    <dl class="kv">
+      <dt>Lives at</dt><dd><code class="inline">~/.cache/huggingface/hub</code></dd>
+      <dt>One-time?</dt><dd>Download is one-time per model. After that it loads from disk into RAM each time the server starts.</dd>
+    </dl>
+  </div>
+</section>
+
+<!-- ============================ CHOOSING A MODEL ============================ -->
+<section id="models">
+  <h2><span class="num">2</span>Choosing a model on Hugging Face</h2>
+  <p class="lead">Almost every model you’ll run lives on <a href="https://huggingface.co/mlx-community" style="color:var(--accent)">huggingface.co</a>. The skill is reading a model’s name and card well enough to answer three questions: <b>Is it MLX-ready? Will it fit in my RAM? Is it the right kind of model?</b></p>
+
+  <h3>2.1 — You want the <em>MLX format</em></h3>
+  <p>A raw model on Hugging Face can be in several formats. For Apple Silicon you want one already converted to <b>MLX</b> — not GGUF (that’s for llama.cpp/Ollama) and not raw PyTorch <code class="inline">safetensors</code> (unconverted).</p>
+  <table>
+    <tr><th>Signal</th><th>What it means</th></tr>
+    <tr><td>Org is <code class="inline">mlx-community</code> or <code class="inline">lmstudio-community</code> (…-MLX-…)</td><td>✅ Pre-converted, loads directly with <code class="inline">mlx_lm</code>.</td></tr>
+    <tr><td>Name/files say <code class="inline">MLX</code> or repo has <code class="inline">model.safetensors</code> + <code class="inline">config.json</code> with an <code class="inline">mlx</code> quant section</td><td>✅ MLX-ready.</td></tr>
+    <tr><td>Files end in <code class="inline">.gguf</code></td><td>❌ GGUF — for llama.cpp/Ollama, not <code class="inline">mlx_lm</code>.</td></tr>
+    <tr><td>Original org (e.g. <code class="inline">google/…</code>, <code class="inline">Qwen/…</code>) with no MLX note</td><td>⚠️ Unconverted. Either find the <code class="inline">mlx-community</code> mirror, or convert it yourself (below).</td></tr>
+  </table>
+  <div class="note">Shortcut: browse the <a href="https://huggingface.co/mlx-community" style="color:var(--accent)">mlx-community</a> org or search Hugging Face for <code class="inline">&lt;model name&gt; mlx 4bit</code>. If no MLX build exists, convert one once:
+  <pre style="margin:10px 0 0"><code><span class="tok-cmd">mlx_lm.convert</span> <span class="tok-flag">--hf-path</span> Qwen/Qwen3-4B-Instruct <span class="tok-flag">-q</span></code></pre></div>
+
+  <h3>2.2 — Decoding the model name</h3>
+  <p>Names look cryptic but are highly structured. Take the default:</p>
+  <pre><code>mlx-community / Qwen3-Coder-30B-A3B-Instruct-4bit
+└──── org ────┘ └─fam─┘ └role┘ └sz┘ └MoE┘ └─tune──┘ └quant┘</code></pre>
+  <table>
+    <tr><th>Part</th><th>Example</th><th>Meaning</th></tr>
+    <tr><td>Org</td><td><code class="inline">mlx-community</code></td><td>Who published it. <code class="inline">mlx-community</code> = community MLX conversions.</td></tr>
+    <tr><td>Family / version</td><td><code class="inline">Qwen3</code>, <code class="inline">gemma-4</code>, <code class="inline">Llama-4</code></td><td>The base model and generation.</td></tr>
+    <tr><td>Specialization</td><td><code class="inline">Coder</code>, <code class="inline">Vision</code></td><td>Tuned for a domain (coding, vision…). Absent = general purpose.</td></tr>
+    <tr><td>Total size</td><td><code class="inline">30B</code>, <code class="inline">26b</code>, <code class="inline">4B</code></td><td><b>Total parameters in billions</b> — the headline number for capability and disk size.</td></tr>
+    <tr><td>Active size (MoE)</td><td><code class="inline">A3B</code>, <code class="inline">A4B</code></td><td><b>“Active” params per token</b> in a Mixture-of-Experts model. A 30B-<code class="inline">A3B</code> model has 30B total but only ~3B compute per token → fast like a 3B, smart like a 30B. <b>RAM tracks total; speed tracks active.</b></td></tr>
+    <tr><td>Tuning</td><td><code class="inline">Instruct</code>, <code class="inline">it</code>, <code class="inline">Chat</code></td><td>Instruction/chat-tuned — what you want for an agent. A bare base model (no suffix) just autocompletes.</td></tr>
+    <tr><td>Quantization</td><td><code class="inline">4bit</code>, <code class="inline">8bit</code>, <code class="inline">bf16</code></td><td>Precision of the weights (next section).</td></tr>
+  </table>
+
+  <h3>2.3 — Understanding quantization</h3>
+  <p>Quantization shrinks each weight from 16 bits to fewer, trading a little quality for big memory savings. It’s the single biggest lever on whether a model fits.</p>
+  <table>
+    <tr><th>Tag</th><th>Bits/weight</th><th>Memory vs full</th><th>Use when</th></tr>
+    <tr><td><code class="inline">bf16</code> / <code class="inline">fp16</code></td><td>16</td><td>1× (baseline)</td><td>Max quality, you have RAM to burn, or fine-tuning.</td></tr>
+    <tr><td><code class="inline">8bit</code> / <code class="inline">Q8</code></td><td>8</td><td>~½</td><td>Near-lossless; great if it fits.</td></tr>
+    <tr><td><code class="inline">4bit</code> / <code class="inline">Q4</code></td><td>4</td><td>~¼</td><td>✅ The sweet spot for local use — big quality, fits most Macs.</td></tr>
+    <tr><td><code class="inline">3bit</code> / lower</td><td>≤3</td><td>&lt;¼</td><td>Squeeze a model that otherwise won’t fit; quality starts to slip.</td></tr>
+  </table>
+  <p class="lead">You may also see <code class="inline">QAT</code> (quantization-aware trained — better quality at low bits) and <em>mixed-precision</em> variants like <code class="inline">OptiQ</code> (sensitive layers kept at 8-bit, rest 4-bit). Both are fine; default to plain <code class="inline">4bit</code> unless a card tells you otherwise.</p>
+
+  <h3>2.4 — Will it fit in memory? (the rule of thumb)</h3>
+  <div class="card" style="margin-top:12px">
+    <p style="margin:0 0 8px"><b>Approx RAM to load = (total params in billions) × (bits ÷ 8) GB, then add ~20–30% headroom for context + the OS.</b></p>
+    <div class="kv">
+      <dt>30B @ 4-bit</dt><dd>30 × 0.5 = <b>~15 GB</b> weights → budget <b>~18–20 GB</b>. ✅ on 32 GB.</dd>
+      <dt>26B @ 4-bit (Gemma)</dt><dd>≈ <b>15.6 GB</b> on disk → budget <b>~20 GB</b>. ✅ on 32 GB.</dd>
+      <dt>70B @ 4-bit</dt><dd>70 × 0.5 = <b>~35 GB</b> → budget <b>~45 GB</b>. Needs 64 GB.</dd>
+      <dt>4B @ 4-bit</dt><dd>≈ <b>2.5 GB</b> → trivially fits 16 GB.</dd>
+    </div>
+    <div class="warnbox" style="margin-top:12px">For MoE models, size against <b>total</b> params (the model is fully resident in RAM); the <code class="inline">A#B</code> active count only affects <em>speed</em>, not memory. Apple Silicon’s unified memory is shared with the GPU, so a model that “fits” still needs room left for your apps — leave a comfortable margin.</div>
+  </div>
+  <p class="lead" style="margin-top:14px">Tip: a model card on Hugging Face shows exact file sizes under <b>“Files and versions”</b> — sum the <code class="inline">.safetensors</code> shards for the real on-disk/in-RAM number, which beats any estimate.</p>
+
+  <h3>2.5 — Quick picks (and the script presets)</h3>
+  <table>
+    <tr><th>Goal</th><th>Model id</th><th>Flag</th><th>Size / RAM</th></tr>
+    <tr><td><b>Test the pipeline (default)</b></td><td><code class="inline">mlx-community/Qwen3-4B-Instruct-2507-4bit</code></td><td><em>(default)</em></td><td>~2 GB / ~16 GB</td></tr>
+    <tr><td>Coding agent</td><td><code class="inline">mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit</code></td><td><code class="inline">--qwen-coder</code></td><td>~16 GB / ~32 GB</td></tr>
+    <tr><td>General + vision</td><td><code class="inline">mlx-community/gemma-4-26b-a4b-it-4bit</code></td><td><code class="inline">--gemma</code></td><td>~15.6 GB / ~32 GB</td></tr>
+    <tr><td>Anything else</td><td>any MLX repo id</td><td><code class="inline">--model &lt;id&gt;</code></td><td>varies</td></tr>
+  </table>
+  <p class="lead">The default is deliberately tiny so you can confirm the whole MLX↔pi loop works in minutes, then switch up with <code class="inline">--qwen-coder</code> for real coding work.</p>
+
+  <h3>2.6 — The script checks size before downloading</h3>
+  <p>Neither script ever pulls weights without telling you the cost first. Before any download, it queries the Hugging Face API for the exact file sizes, prints the download size + a rough RAM estimate, warns if it exceeds your memory, and waits for a <code class="inline">y/N</code> confirmation (default <b>No</b>). If the model is already cached, it skips straight through. Use <code class="inline">-y</code>/<code class="inline">--yes</code> to bypass the prompt for automation.</p>
+  <pre><code><span class="tok-comment"># Example of what you'll see when a model isn't cached yet:</span>
+ℹ️  Querying Hugging Face for the size of: mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit
+📦 Download size : ~16.0 GB   (to ~/.cache/huggingface/hub)
+🧠 RAM to run    : ~20 GB     (rough estimate; you have 32 GB)
+❓ Download this model (~16.0 GB) now? [y/N]</code></pre>
+</section>
+
+<!-- ============================ DIAGRAM ============================ -->
+<section id="diagram">
+  <h2><span class="num">3</span>How the pieces fit together</h2>
+  <p class="lead">Blue = installed once. Orange = runs while you work. Green = data on disk.</p>
+  <div class="legend">
+    <span><span class="swatch" style="background:#2c3470"></span> install-once tool</span>
+    <span><span class="swatch" style="background:#5a4424"></span> runtime process (daemon)</span>
+    <span><span class="swatch" style="background:#244a2c"></span> files on disk</span>
+  </div>
+  <div class="mermaid">
+flowchart TB
+    subgraph YOU[" "]
+      direction TB
+      U["👩‍💻 You<br/>in a terminal / editor"]
+    end
+
+    subgraph INSTALL["🧰 Installed once (global)"]
+      direction LR
+      UV["uv<br/><small>~/.local/bin</small>"]
+      MLXLM["mlx-lm CLIs<br/><small>mlx_lm.server / generate / chat</small>"]
+      PI["pi agent<br/><small>npm -g</small>"]
+      UV -. installs .-> MLXLM
+    end
+
+    subgraph RUNTIME["🔴 Running while you work"]
+      direction TB
+      SERVER["🌐 MLX server<br/><small>localhost:8080 · OpenAI API</small>"]
+      MODEL_MEM["🧠 Model in unified memory<br/><small>M5 Metal-4 tensor cores</small>"]
+      SERVER --- MODEL_MEM
+    end
+
+    subgraph DISK["💾 On disk"]
+      HFCACHE["Model weights<br/><small>~/.cache/huggingface/hub</small>"]
+      PICONF["pi config<br/><small>~/.pi/agent/models.json</small>"]
+    end
+
+    U -->|"runs pi"| PI
+    PI -->|"reads provider 'local-mlx'"| PICONF
+    PI -->|"POST /v1/chat/completions"| SERVER
+    SERVER -->|"streams tokens back"| PI
+    MLXLM -->|"you start it"| SERVER
+    SERVER -->|"loads on first use"| HFCACHE
+    HFCACHE -->|"into RAM"| MODEL_MEM
+
+    classDef inst fill:#12152b,stroke:#2c3470,color:#cfd6ff;
+    classDef run fill:#241a0e,stroke:#5a4424,color:#ffd9a0;
+    classDef disk fill:#0f1d13,stroke:#244a2c,color:#bfe7c6;
+    classDef you fill:#161b22,stroke:#2a3340,color:#e6edf3;
+    class UV,MLXLM,PI inst;
+    class SERVER,MODEL_MEM run;
+    class HFCACHE,PICONF disk;
+    class U you;
+  </div>
+</section>
+
+<!-- ============================ STEPS ============================ -->
+<section id="steps">
+  <h2><span class="num">4</span>Step by step — exactly what each command does</h2>
+  <p class="lead">These are the raw commands <code class="inline">./mlx-pi setup</code> (steps 1–4) and <code class="inline">./mlx-pi up</code> / <code class="inline">pi</code> (steps 5–6) run for you. Shown here so you understand every line.</p>
+
+  <div class="step-h"><div class="dot">1</div><h3>Install uv</h3></div>
+  <p><span class="pill once">one-time</span> Downloads a static binary; touches no system Python.</p>
+  <pre><code><span class="tok-cmd">curl</span> <span class="tok-flag">-LsSf</span> https://astral.sh/uv/install.sh | <span class="tok-cmd">sh</span>
+<span class="tok-comment"># installs to ~/.local/bin and adds it to your shell PATH</span></code></pre>
+
+  <div class="step-h"><div class="dot">2</div><h3>Install MLX globally as a uv tool</h3></div>
+  <p><span class="pill once">one-time</span> Creates an isolated env for mlx-lm but exposes its CLIs everywhere — the “install globally, use across projects” behavior you want. (mlx-lm pulls in <code class="inline">mlx</code> automatically.)</p>
+  <pre><code><span class="tok-cmd">uv</span> tool install mlx-lm
+<span class="tok-comment"># later, to update:  uv tool install --upgrade mlx-lm</span>
+<span class="tok-comment"># verify:</span>
+<span class="tok-cmd">mlx_lm.server</span> <span class="tok-flag">--help</span></code></pre>
+  <div class="note">Why uv tool and not <code class="inline">uv pip</code> / a venv? <code class="inline">uv tool</code> is for <b>applications you run by name</b> (like pipx). One global copy, always on PATH, zero per-project setup.</div>
+
+  <div class="step-h"><div class="dot">3</div><h3>Install pi (the harness)</h3></div>
+  <p><span class="pill once">one-time</span> Needs Node; install via Homebrew or nodejs.org if missing.</p>
+  <pre><code><span class="tok-cmd">brew</span> install node            <span class="tok-comment"># if you don't have Node</span>
+<span class="tok-cmd">npm</span> install <span class="tok-flag">-g --ignore-scripts</span> @earendil-works/pi-coding-agent</code></pre>
+  <div class="note">🔒 <code class="inline">--ignore-scripts</code> is the latest recommended install: pi needs no post-install scripts, so skipping them is faster and avoids running arbitrary lifecycle scripts during install.</div>
+
+  <div class="step-h"><div class="dot">4</div><h3>Tell pi about your local server</h3></div>
+  <p><span class="pill once">one-time</span> Register a provider named <code class="inline">local-mlx</code> in <code class="inline">~/.pi/agent/models.json</code>. The <code class="inline">apiKey</code> is required by the OpenAI client but ignored by MLX — any string works.</p>
+  <pre><code>{
+  <span class="tok-str">"providers"</span>: {
+    <span class="tok-str">"local-mlx"</span>: {
+      <span class="tok-str">"baseUrl"</span>: <span class="tok-str">"http://localhost:8080/v1"</span>,
+      <span class="tok-str">"api"</span>: <span class="tok-str">"openai-completions"</span>,
+      <span class="tok-str">"apiKey"</span>: <span class="tok-str">"local-mlx-no-key-needed"</span>,
+      <span class="tok-str">"models"</span>: [
+        {
+          <span class="tok-str">"id"</span>: <span class="tok-str">"mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit"</span>,
+          <span class="tok-str">"input"</span>: [<span class="tok-str">"text"</span>],
+          <span class="tok-str">"contextWindow"</span>: 131072,
+          <span class="tok-str">"maxTokens"</span>: 8192
+        }
+      ]
+    }
+  }
+}</code></pre>
+
+  <div class="step-h"><div class="dot">5</div><h3>Start the MLX server</h3></div>
+  <p><span class="pill daemon">background daemon</span> The first run downloads the model (several GB) into the HF cache, then loads it into memory and starts serving. Subsequent starts just load from disk.</p>
+  <pre><code><span class="tok-cmd">mlx_lm.server</span> <span class="tok-flag">--model</span> mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit \
+              <span class="tok-flag">--host</span> 127.0.0.1 <span class="tok-flag">--port</span> 8080
+<span class="tok-comment"># health check (in another terminal):</span>
+<span class="tok-cmd">curl</span> http://localhost:8080/v1/models</code></pre>
+  <div class="warnbox">⚠️ This holds the model in RAM the whole time it runs. A 30B 4-bit MoE uses roughly ~18–20 GB. Stop the server (next section) when you’re done to reclaim memory.</div>
+
+  <div class="step-h"><div class="dot">6</div><h3>Run pi against it</h3></div>
+  <p><span class="pill cli">interactive</span> Launch pi, then pick the <code class="inline">local-mlx</code> model.</p>
+  <pre><code><span class="tok-cmd">pi</span>
+<span class="tok-comment"># inside pi:  /model   → choose  local-mlx</span></code></pre>
+</section>
+
+<!-- ============================ SEQUENCE ============================ -->
+<section id="sequence">
+  <h2><span class="num">5</span>What actually happens when you ask pi a question</h2>
+  <p class="lead">The runtime round-trip — note nothing leaves <code class="inline">localhost</code>.</p>
+  <div class="mermaid">
+sequenceDiagram
+    autonumber
+    participant You as 👩‍💻 You
+    participant Pi as 🤖 pi (agent)
+    participant Srv as 🌐 MLX server :8080
+    participant GPU as 🧠 M5 GPU / Metal-4
+    You->>Pi: "refactor this function"
+    Note over Pi: reads ~/.pi/agent/models.json<br/>provider = local-mlx
+    Pi->>Srv: POST /v1/chat/completions (prompt + tools)
+    Srv->>GPU: run model (prefill + decode)
+    Note over GPU: M5 tensor cores → up to 4× faster<br/>first-token vs M4
+    GPU-->>Srv: tokens
+    Srv-->>Pi: streamed response (maybe a tool call)
+    Note over Pi: executes Read/Write/Edit/Bash locally
+    Pi-->>You: edits applied + explanation
+  </div>
+</section>
+
+<!-- ============================ ON/OFF ============================ -->
+<section id="onoff">
+  <h2><span class="num">6</span>Turning it on and off</h2>
+  <p class="lead">Only the server is stateful. <code class="inline">./mlx-pi</code> wraps start order, a health-wait, and clean shutdown.</p>
+  <div class="onoff">
+    <div class="b on">
+      <h4><span class="emoji">🟢</span> ON</h4>
+      <pre style="margin:0"><code><span class="tok-cmd">./mlx-pi</span> up      <span class="tok-comment"># start + wait healthy</span>
+<span class="tok-cmd">./mlx-pi</span> pi      <span class="tok-comment"># up (if needed) + launch pi</span>
+<span class="tok-cmd">./mlx-pi</span> status  <span class="tok-comment"># running? healthy?</span></code></pre>
+    </div>
+    <div class="b off">
+      <h4><span class="emoji">🔴</span> OFF</h4>
+      <pre style="margin:0"><code><span class="tok-cmd">./mlx-pi</span> down    <span class="tok-comment"># stop, free RAM</span>
+<span class="tok-cmd">./mlx-pi</span> restart <span class="tok-comment"># reload model</span>
+<span class="tok-cmd">./mlx-pi</span> logs    <span class="tok-comment"># watch output</span></code></pre>
+    </div>
+  </div>
+  <div class="note">The server runs in the background and survives closing the terminal (its PID is tracked in <code class="inline">~/.mlx-pi/server.pid</code>, logs in <code class="inline">~/.mlx-pi/server.log</code>). By default it does <b>not</b> auto-start on reboot — start it when you want it. To change that, see the next subsection.</div>
+
+  <h3 id="startup" style="margin-top:34px">6.1 — Optional: run the server at startup (launchd)</h3>
+  <p>macOS starts background user programs with <b>launchd</b> via small <code class="inline">.plist</code> files in <code class="inline">~/Library/LaunchAgents</code>. <code class="inline">./mlx-pi plist</code> <b>generates</b> a personalized one (your real home dir, model, and port already filled in) but <b>does not install it</b> — you opt in with the steps below.</p>
+  <div class="warnbox">⚠️ A launchd server is <b>always on</b>: it loads the model into RAM at login and reloads if it crashes. Great for a dedicated machine; less ideal on a laptop where you want that memory back. Prefer the small default model here, or stick with manual <code class="inline">./mlx-pi up</code>/<code class="inline">down</code>.</div>
+
+  <h4 style="margin:18px 0 4px">Step 1 — generate the plist</h4>
+  <pre><code><span class="tok-cmd">./mlx-pi</span> plist                 <span class="tok-comment"># default model + port 8080</span>
+<span class="tok-cmd">./mlx-pi</span> plist <span class="tok-flag">--qwen-coder</span>    <span class="tok-comment"># serve the coder model at login</span>
+<span class="tok-comment"># → writes com.mlx-pi.server.plist with absolute paths baked in</span></code></pre>
+
+  <h4 style="margin:18px 0 4px">Step 2 — install &amp; enable</h4>
+  <pre><code><span class="tok-comment"># copy into the per-user LaunchAgents folder</span>
+<span class="tok-cmd">cp</span> com.mlx-pi.server.plist ~/Library/LaunchAgents/
+<span class="tok-comment"># load it (also starts it now because RunAtLoad=true)</span>
+<span class="tok-cmd">launchctl</span> load ~/Library/LaunchAgents/com.mlx-pi.server.plist
+<span class="tok-comment"># confirm it's registered (look for com.mlx-pi.server)</span>
+<span class="tok-cmd">launchctl</span> list | <span class="tok-cmd">grep</span> mlx-pi
+<span class="tok-comment"># verify it's actually serving</span>
+<span class="tok-cmd">curl</span> http://localhost:8080/v1/models</code></pre>
+
+  <h4 style="margin:18px 0 4px">Step 3 — manage / disable later</h4>
+  <pre><code><span class="tok-comment"># stop + unregister (won't start at next login)</span>
+<span class="tok-cmd">launchctl</span> unload ~/Library/LaunchAgents/com.mlx-pi.server.plist
+<span class="tok-comment"># remove entirely</span>
+<span class="tok-cmd">rm</span> ~/Library/LaunchAgents/com.mlx-pi.server.plist
+<span class="tok-comment"># logs from the launchd-managed server:</span>
+<span class="tok-cmd">tail</span> <span class="tok-flag">-f</span> ~/.mlx-pi/launchd.err.log</code></pre>
+  <div class="note">To change the model/port later, re-run <code class="inline">./mlx-pi plist</code> with new flags, then <code class="inline">launchctl unload</code> + <code class="inline">load</code> again. The manual <code class="inline">./mlx-pi up</code>/<code class="inline">down</code> commands still work, but don't run both at once on the same port.</div>
+</section>
+
+<!-- ============================ PI INTEGRATION ============================ -->
+<section id="pi">
+  <h2><span class="num">7</span>The pi ↔ MLX integration, precisely</h2>
+  <table>
+    <tr><th>Concern</th><th>How it works</th></tr>
+    <tr><td>Transport</td><td>Plain HTTP to <code class="inline">http://localhost:8080/v1</code>. pi’s <code class="inline">openai-completions</code> API type speaks the OpenAI wire format, which <code class="inline">mlx_lm.server</code> implements.</td></tr>
+    <tr><td>Which model</td><td>The <code class="inline">id</code> in <code class="inline">models.json</code> must match the model the server loaded (<code class="inline">--model</code>). Mismatch → pi asks for a model the server doesn’t have.</td></tr>
+    <tr><td>API key</td><td>Required field, ignored by MLX. Use any non-empty placeholder.</td></tr>
+    <tr><td>Switching models</td><td>Inside pi: <code class="inline">/model</code>. To serve a different model, restart the server with a new <code class="inline">--model</code> and add a matching entry to <code class="inline">models.json</code>.</td></tr>
+    <tr><td>Tools</td><td>pi runs Read/Write/Edit/Bash <em>locally</em> on your machine; only the chat/tool-call messages go to the model. Pick a tool-use-capable model (the Qwen3-Coder default is).</td></tr>
+  </table>
+</section>
+
+<!-- ============================ CHEAT SHEET ============================ -->
+<section id="cheat">
+  <h2><span class="num">8</span>Cheat sheet</h2>
+  <div class="grid two">
+    <div class="card">
+      <h3>Setup (run once)</h3>
+      <pre style="margin:0"><code><span class="tok-cmd">./bootstrap.sh</span>                  <span class="tok-comment"># install uv (once)</span>
+<span class="tok-cmd">./mlx-pi</span> setup                  <span class="tok-comment"># install + small default model</span>
+<span class="tok-cmd">./mlx-pi</span> setup <span class="tok-flag">--qwen-coder</span>     <span class="tok-comment"># preset: Qwen3-Coder 30B</span>
+<span class="tok-cmd">./mlx-pi</span> setup <span class="tok-flag">--gemma</span>          <span class="tok-comment"># preset: Gemma 4 26B (text+image)</span>
+<span class="tok-cmd">./mlx-pi</span> setup <span class="tok-flag">--prefetch</span>        <span class="tok-comment"># download now (asks: size? [y/N])</span>
+<span class="tok-cmd">./mlx-pi</span> setup <span class="tok-flag">--model</span> &lt;hf-repo-id&gt;
+<span class="tok-cmd">./mlx-pi</span> <span class="tok-flag">--help</span></code></pre>
+    </div>
+    <div class="card">
+      <h3>Daily driving</h3>
+      <pre style="margin:0"><code><span class="tok-cmd">./mlx-pi</span> up                  <span class="tok-comment"># small default model</span>
+<span class="tok-cmd">./mlx-pi</span> up <span class="tok-flag">--qwen-coder</span>     <span class="tok-comment"># serve the coder model</span>
+<span class="tok-cmd">./mlx-pi</span> up <span class="tok-flag">--gemma</span>          <span class="tok-comment"># serve Gemma instead</span>
+<span class="tok-cmd">./mlx-pi</span> pi
+<span class="tok-cmd">./mlx-pi</span> down
+<span class="tok-cmd">./mlx-pi</span> status <span class="tok-flag">--help</span></code></pre>
+    </div>
+    <div class="card">
+      <h3>Quick manual tests</h3>
+      <pre style="margin:0"><code><span class="tok-cmd">mlx_lm.chat</span>                 <span class="tok-comment"># REPL, no server</span>
+<span class="tok-cmd">mlx_lm.generate</span> <span class="tok-flag">--prompt</span> <span class="tok-str">"hi"</span>
+<span class="tok-cmd">curl</span> localhost:8080/v1/models</code></pre>
+    </div>
+    <div class="card">
+      <h3>Memory → model size (rough)</h3>
+      <table style="margin-top:6px">
+        <tr><th>RAM</th><th>Comfortable model</th></tr>
+        <tr><td>16 GB</td><td>3–4B 4-bit</td></tr>
+        <tr><td>32 GB</td><td>30B-A3B MoE 4-bit (default)</td></tr>
+        <tr><td>64 GB+</td><td>70B-class 4-bit</td></tr>
+      </table>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ TROUBLE ============================ -->
+<section id="trouble">
+  <h2><span class="num">9</span>Troubleshooting</h2>
+  <table>
+    <tr><th>Symptom</th><th>Fix</th></tr>
+    <tr><td><code class="inline">uv: command not found</code> when running <code class="inline">./mlx-pi</code></td><td>Run <code class="inline">./bootstrap.sh</code> first (it installs uv), then open a new terminal.</td></tr>
+    <tr><td>First <code class="inline">./mlx-pi</code> run pauses a few seconds</td><td>Normal — uv is building the script's dependency env (<code class="inline">rich</code>, <code class="inline">httpx</code>). It's cached after that.</td></tr>
+    <tr><td><code class="inline">mlx_lm.server: command not found</code></td><td>Open a new terminal so PATH refreshes. fish users: <code class="inline">fish_add_path ~/.local/bin</code>.</td></tr>
+    <tr><td>pi hangs on first message</td><td>Server is likely still downloading the model. Watch <code class="inline">./mlx-pi logs</code>; the <code class="inline">up</code> command waits for health for you.</td></tr>
+    <tr><td>Out of memory / system sluggish</td><td>Model too big for your RAM. Use a smaller one (see table) and close other heavy apps.</td></tr>
+    <tr><td>pi can’t reach the model</td><td>Confirm the server is up: <code class="inline">curl localhost:8080/v1/models</code>, and that the <code class="inline">id</code> in models.json matches <code class="inline">--model</code>.</td></tr>
+    <tr><td>Port already in use</td><td>Run the server on another port: <code class="inline">./mlx-pi up --port 8090</code> and re-run <code class="inline">./mlx-pi setup --port 8090</code> to update <code class="inline">baseUrl</code>.</td></tr>
+  </table>
+</section>
+
+<footer>
+  <p><b>Sources & further reading</b></p>
+  <p>
+    <a href="https://machinelearning.apple.com/research/exploring-llms-mlx-m5">Apple ML Research — Exploring LLMs with MLX & the M5 GPU</a> ·
+    <a href="https://github.com/ml-explore/mlx-lm">ml-explore/mlx-lm</a> ·
+    <a href="https://github.com/ml-explore/mlx">ml-explore/mlx</a> ·
+    <a href="https://www.youtube.com/watch?v=wykPErJ8M-8">WWDC26 — Run local agentic AI on the Mac using MLX</a> ·
+    <a href="https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/docs/custom-provider.md">pi — custom provider docs</a> ·
+    <a href="https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/docs/models.md">pi — models config</a> ·
+    <a href="https://patloeber.com/gemma-4-pi-agent/">Patrick Loeber — local coding agent with pi</a> ·
+    <a href="https://docs.astral.sh/uv/">uv docs</a>
+  </p>
+  <p style="margin-top:14px">Generated June 2026 · for Apple M5 · pair this page with <code class="inline">bootstrap.sh</code> and the <code class="inline">mlx-pi</code> CLI.</p>
+</footer>
+
+</div>
+<script>
+  mermaid.initialize({
+    startOnLoad:true,
+    theme:'base',
+    themeVariables:{
+      background:'#161b22',
+      primaryColor:'#1c2330', primaryTextColor:'#e6edf3', primaryBorderColor:'#2a3340',
+      lineColor:'#7c93ff', secondaryColor:'#241a0e', tertiaryColor:'#0f1d13',
+      fontFamily:'-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif', fontSize:'14px',
+      actorBkg:'#1c2330', actorBorder:'#7c93ff', actorTextColor:'#e6edf3',
+      signalColor:'#9aa7b4', signalTextColor:'#cfe0f0', noteBkgColor:'#241a0e',
+      noteTextColor:'#ffd9a0', noteBorderColor:'#5a4424'
+    }
+  });
+</script>
+</body>
+</html>

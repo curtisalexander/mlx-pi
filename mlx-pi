@@ -1,0 +1,624 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["rich>=13", "httpx>=0.27"]
+# ///
+#
+# ============================================================================
+#  mlx-pi  —  One tool to run local LLMs on Apple Silicon with MLX + pi.
+# ============================================================================
+#
+#  Run `./bootstrap.sh` ONCE first (it installs uv). After that, the `uv run`
+#  shebang above makes this script self-contained: uv builds an isolated env
+#  with `rich` (pretty output) and `httpx` (Hugging Face queries) on first run,
+#  then caches it. No virtualenv to manage.
+#
+#  SUBCOMMANDS
+#    setup     Install mlx-lm + pi, and point pi at the local server.
+#    up        Start the MLX server in the background; wait until healthy.
+#    down      Stop the background server.
+#    restart   down + up.
+#    status    Show running state + health.
+#    logs      Tail the server log.
+#    run       Run the server in the FOREGROUND (Ctrl-C to stop).
+#    pi        Ensure the server is up, then launch the pi agent.
+#    plist     Generate a personalized launchd plist (does NOT install it).
+#
+#  Try:  ./mlx-pi --help   or   ./mlx-pi <subcommand> --help
+# ============================================================================
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import platform
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import httpx
+from rich.console import Console
+from rich.prompt import Confirm
+from rich.table import Table
+
+console = Console()
+
+# ============================================================================
+#  Configuration / constants
+# ============================================================================
+
+# DEFAULT model: a small (~2 GB) Qwen3 4B 4-bit. Downloads in seconds — perfect
+# for confirming the whole MLX<->pi pipeline works before committing to a big
+# model. Override with --model, or the --qwen-coder / --gemma presets.
+DEFAULT_MODEL = "mlx-community/Qwen3-4B-Instruct-2507-4bit"
+QWEN_CODER_MODEL = "mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit"  # ~16 GB
+GEMMA_MODEL = "mlx-community/gemma-4-26b-a4b-it-4bit"                 # ~15.6 GB, text+image
+
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 8080
+DEFAULT_MAX_TOKENS = 4096
+
+# pi reads providers/models from here. We register a provider named "local-mlx".
+PI_PROVIDER_ID = "local-mlx"
+PI_CONFIG_DIR = Path.home() / ".pi" / "agent"
+PI_CONFIG_FILE = PI_CONFIG_DIR / "models.json"
+
+# Runtime state (pid + logs) lives here, surviving across terminals.
+STATE_DIR = Path(os.environ.get("MLX_STATE_DIR", Path.home() / ".mlx-pi"))
+PID_FILE = STATE_DIR / "server.pid"
+LOG_FILE = STATE_DIR / "server.log"
+
+# npm package for the pi coding agent (latest recommended install).
+PI_NPM_PKG = "@earendil-works/pi-coding-agent"
+
+HF_CACHE = Path.home() / ".cache" / "huggingface" / "hub"
+
+
+# ============================================================================
+#  Small output helpers (rich gives us color + emoji for free)
+# ============================================================================
+
+def step(msg: str) -> None:
+    console.print(f"\n[bold magenta]▶ {msg}[/]")
+
+def info(msg: str) -> None:
+    console.print(f"  [blue]ℹ️  {msg}[/]")
+
+def ok(msg: str) -> None:
+    console.print(f"  [green]✅ {msg}[/]")
+
+def warn(msg: str) -> None:
+    console.print(f"  [yellow]⚠️  {msg}[/]")
+
+def err(msg: str) -> None:
+    console.print(f"  [red]❌ {msg}[/]")
+
+def have(cmd: str) -> str | None:
+    """Return the full path to `cmd` if on PATH, else None (idempotency check)."""
+    return shutil.which(cmd)
+
+def run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
+    """Echo a command (transparency) then run it, raising on failure."""
+    console.print(f"  [dim]$ {' '.join(cmd)}[/]")
+    return subprocess.run(cmd, check=True, **kw)
+
+
+# ============================================================================
+#  Platform info
+# ============================================================================
+
+def sysctl(key: str) -> str:
+    try:
+        return subprocess.check_output(["sysctl", "-n", key], text=True).strip()
+    except Exception:
+        return ""
+
+def ram_gb() -> int:
+    try:
+        return int(sysctl("hw.memsize")) // (1024 ** 3)
+    except Exception:
+        return 0
+
+def require_apple_silicon() -> None:
+    if platform.system() != "Darwin":
+        err(f"macOS only (you're on {platform.system()}).")
+        sys.exit(1)
+    if platform.machine() != "arm64":
+        err(f"MLX needs Apple Silicon (arm64); detected {platform.machine()}.")
+        sys.exit(1)
+
+
+# ============================================================================
+#  Hugging Face size lookup + download confirmation
+#  (We NEVER pull weights without telling you the size first.)
+# ============================================================================
+
+def hf_model_size_bytes(repo: str) -> int | None:
+    """Sum the byte sizes of every file in the repo's main revision. None on failure."""
+    url = f"https://huggingface.co/api/models/{repo}/tree/main?recursive=true"
+    try:
+        r = httpx.get(url, timeout=15, follow_redirects=True)
+        r.raise_for_status()
+        files = r.json()
+        total = sum(f.get("size", 0) for f in files if f.get("type") == "file")
+        return total or None
+    except Exception:
+        return None
+
+def model_is_cached(repo: str) -> bool:
+    """True if the model already exists in the local HF cache (nothing to download)."""
+    d = HF_CACHE / f"models--{repo.replace('/', '--')}"
+    snaps = d / "snapshots"
+    return snaps.is_dir() and any(snaps.iterdir())
+
+def confirm_download(repo: str, assume_yes: bool) -> bool:
+    """Show download size + RAM estimate and ask to proceed. True = go ahead."""
+    if model_is_cached(repo):
+        ok(f"Model already in local cache — no download needed: {repo}")
+        return True
+
+    info(f"Querying Hugging Face for the size of: [bold]{repo}[/]")
+    size = hf_model_size_bytes(repo)
+    if size:
+        gb_disk = size / 1024 ** 3
+        gb_ram = gb_disk * 1.25  # rough: weights + context + overhead
+        have_ram = ram_gb()
+        console.print(f"  [bold]📦 Download size : ~{gb_disk:.1f} GB[/]   (to {HF_CACHE})")
+        console.print(f"  [bold]🧠 RAM to run    : ~{gb_ram:.0f} GB[/]   "
+                      f"(rough estimate; you have {have_ram} GB)")
+        if have_ram and gb_ram > have_ram:
+            warn("This model's estimated RAM need exceeds your installed memory!")
+        size_str = f"{gb_disk:.1f} GB"
+    else:
+        warn("Couldn't read the size from Hugging Face (offline / bad id).")
+        size_str = "unknown size"
+
+    if assume_yes:
+        info("--yes given — proceeding with download.")
+        return True
+    # Default is No, so an accidental Enter never starts a big download.
+    return Confirm.ask(f"  [yellow]❓ Download this model (~{size_str}) now?[/]", default=False)
+
+
+# ============================================================================
+#  Model resolution (shared by several subcommands)
+# ============================================================================
+
+def resolve_model(args) -> str:
+    """Turn --model / --qwen-coder / --gemma flags into a concrete repo id."""
+    if getattr(args, "qwen_coder", False):
+        return QWEN_CODER_MODEL
+    if getattr(args, "gemma", False):
+        return GEMMA_MODEL
+    if getattr(args, "model", None):
+        return args.model
+    return os.environ.get("MLX_MODEL", DEFAULT_MODEL)
+
+def add_model_flags(p: argparse.ArgumentParser) -> None:
+    """Attach the common model-selection flags to a subparser."""
+    p.add_argument("-m", "--model", help="Hugging Face MLX model id to use")
+    p.add_argument("--qwen-coder", action="store_true",
+                   help=f"Preset: {QWEN_CODER_MODEL}")
+    p.add_argument("--gemma", action="store_true",
+                   help=f"Preset: {GEMMA_MODEL} (text+image)")
+
+
+# ============================================================================
+#  Server process management (PID file + health checks)
+# ============================================================================
+
+def server_pid() -> int | None:
+    if not PID_FILE.exists():
+        return None
+    try:
+        pid = int(PID_FILE.read_text().strip())
+    except Exception:
+        return None
+    # os.kill(pid, 0) raises if the process is gone.
+    try:
+        os.kill(pid, 0)
+        return pid
+    except OSError:
+        return None
+
+def is_healthy(host: str, port: int) -> bool:
+    try:
+        r = httpx.get(f"http://{host}:{port}/v1/models", timeout=2)
+        return r.status_code == 200
+    except Exception:
+        return False
+
+def server_bin() -> str:
+    """Absolute path to mlx_lm.server (uv installs it to ~/.local/bin)."""
+    return have("mlx_lm.server") or str(Path.home() / ".local" / "bin" / "mlx_lm.server")
+
+def require_mlx() -> None:
+    if not have("mlx_lm.server"):
+        err("mlx_lm.server not found. Run './mlx-pi setup' first (then open a new terminal).")
+        sys.exit(1)
+
+
+# ============================================================================
+#  SUBCOMMAND: setup
+# ============================================================================
+
+def cmd_setup(args) -> None:
+    model = resolve_model(args)
+    port = args.port
+    base_url = f"http://localhost:{port}/v1"
+
+    console.print("\n[bold cyan]🍎 mlx-pi setup — MLX + pi for Apple Silicon[/]")
+    info(f"Model:    [bold]{model}[/]")
+    info(f"pi URL:   [bold]{base_url}[/]")
+
+    # --- 1. Platform -------------------------------------------------------
+    step("Step 1/5 · Checking your machine")
+    require_apple_silicon()
+    chip = sysctl("machdep.cpu.brand_string") or "Apple Silicon"
+    ok(f"Running on [bold]{chip}[/] with [bold]{ram_gb()} GB[/] unified memory")
+
+    # --- 2. mlx-lm (global uv tool) ---------------------------------------
+    step("Step 2/5 · Installing mlx-lm globally (uv tool)")
+    if not have("uv"):
+        err("uv not found. Run ./bootstrap.sh first.")
+        sys.exit(1)
+    # `uv tool install` = isolated env, but CLIs exposed globally on PATH.
+    # --upgrade makes this idempotent (installs or updates a single global copy).
+    run(["uv", "tool", "install", "--upgrade", "mlx-lm"])
+    if have("mlx_lm.server"):
+        ok("mlx-lm ready — mlx_lm.server / generate / chat are on PATH")
+    else:
+        warn("mlx-lm installed but not yet on PATH — open a new terminal (or run 'uv tool update-shell').")
+
+    # --- 3. Node + pi -----------------------------------------------------
+    step("Step 3/5 · Installing Node.js + pi harness")
+    if not have("node"):
+        if have("brew"):
+            run(["brew", "install", "node"])
+        else:
+            err("Node.js required for pi, and Homebrew isn't installed.")
+            console.print("     Fix: install Node from https://nodejs.org (LTS), then re-run.")
+            sys.exit(1)
+    else:
+        ok(f"Node present ({subprocess.check_output(['node', '--version'], text=True).strip()})")
+    # --ignore-scripts is the latest recommended install: pi needs no lifecycle
+    # scripts, so skipping them is faster and avoids running arbitrary scripts.
+    run(["npm", "install", "-g", "--ignore-scripts", PI_NPM_PKG])
+    ok("pi installed") if have("pi") else warn("pi not on PATH — check `npm root -g`.")
+
+    # --- 4. Configure pi --> local server ---------------------------------
+    step("Step 4/5 · Pointing pi at the local MLX server")
+    configure_pi(model, base_url)
+
+    # --- 5. Optional prefetch (with size confirmation) --------------------
+    step("Step 5/5 · Model download")
+    if args.prefetch:
+        if confirm_download(model, args.yes):
+            info(f"Downloading & warming {model} …")
+            run([server_bin().replace("mlx_lm.server", "mlx_lm.generate"),
+                 "--model", model, "--prompt", "Say ok.", "--max-tokens", "1"])
+            ok("Model downloaded and verified.")
+        else:
+            warn("Download skipped — the server will fetch it on first 'up'.")
+    else:
+        info("Skipping download. './mlx-pi up' will fetch it (with a size check) on first use.")
+
+    _print_setup_summary(model)
+
+def configure_pi(model: str, base_url: str) -> None:
+    """Write/merge the local-mlx provider into pi's models.json (native JSON — no heredocs!)."""
+    PI_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    # Gemma 4 is multimodal; others here are text-only.
+    inputs = ["text", "image"] if model == GEMMA_MODEL else ["text"]
+    provider = {
+        "baseUrl": base_url,
+        "api": "openai-completions",
+        "apiKey": "local-mlx-no-key-needed",  # required by client, ignored by MLX
+        "models": [{
+            "id": model,
+            "name": f"MLX · {model.split('/')[-1]}",
+            "reasoning": False,
+            "input": inputs,
+            "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+            "contextWindow": 131072,
+            "maxTokens": 8192,
+        }],
+    }
+    if PI_CONFIG_FILE.exists():
+        backup = PI_CONFIG_FILE.with_suffix(f".json.bak.{int(time.time())}")
+        backup.write_text(PI_CONFIG_FILE.read_text())
+        info(f"Existing config backed up → {backup.name}")
+        try:
+            data = json.loads(PI_CONFIG_FILE.read_text())
+        except Exception:
+            data = {}
+    else:
+        data = {}
+    data.setdefault("providers", {})[PI_PROVIDER_ID] = provider
+    PI_CONFIG_FILE.write_text(json.dumps(data, indent=2))
+    ok(f"Configured provider '{PI_PROVIDER_ID}' → {base_url}")
+
+def _print_setup_summary(model: str) -> None:
+    console.print("\n[bold green]╔═══════════════════════════════════╗[/]")
+    console.print("[bold green]║          ✅  SETUP COMPLETE        ║[/]")
+    console.print("[bold green]╚═══════════════════════════════════╝[/]")
+    console.print("\n[bold]Next steps:[/]")
+    console.print("  1️⃣  [cyan]./mlx-pi up[/]      start the MLX server (background)")
+    console.print("  2️⃣  [cyan]./mlx-pi pi[/]      launch the coding agent")
+    console.print("  3️⃣  [cyan]./mlx-pi down[/]    stop & free memory")
+    r = ram_gb()
+    console.print(f"\n[bold]Memory note[/] (you have {r} GB):")
+    if r >= 64:
+        console.print("  [green]Plenty of headroom — 30B MoE flies; 70B-class 4-bit fits too.[/]")
+    elif r >= 32:
+        console.print("  [green]Great for --qwen-coder (30B MoE) or --gemma.[/]")
+    elif r >= 16:
+        console.print("  [green]The small default Qwen3 4B is ideal here; 30B will be tight.[/]")
+    else:
+        console.print("  [yellow]Stick to ~3–4B 4-bit models.[/]")
+    console.print("\n[bold]Optional — run at login:[/] generate a launchd file with "
+                  "[cyan]./mlx-pi plist[/] (it won't install it; see the HTML guide).")
+    console.print("[dim]If 'mlx_lm.server' or 'pi' aren't found, open a NEW terminal so PATH refreshes.[/]")
+
+
+# ============================================================================
+#  SUBCOMMAND: up / down / restart / status / logs / run / pi
+# ============================================================================
+
+def cmd_up(args) -> bool:
+    require_mlx()
+    model = resolve_model(args)
+    host, port = args.host, args.port
+
+    pid = server_pid()
+    if pid:
+        if is_healthy(host, port):
+            ok(f"MLX server already up & healthy at http://{host}:{port}")
+            return True
+        warn("Server process exists but isn't answering — restarting it.")
+        cmd_down(args)
+
+    if not confirm_download(model, args.yes):
+        warn("Not starting server.")
+        return False
+
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    info("Starting MLX server (background daemon)…")
+    info(f"  model: [bold]{model}[/]   bind: [bold]{host}:{port}[/]")
+    info(f"  log  : {LOG_FILE}")
+
+    # Launch detached: start_new_session puts it in its own process group so it
+    # survives this CLI exiting; output is appended to the log file.
+    logf = open(LOG_FILE, "a")
+    proc = subprocess.Popen(
+        [server_bin(), "--model", model, "--host", host,
+         "--port", str(port), "--max-tokens", str(DEFAULT_MAX_TOKENS)],
+        stdout=logf, stderr=subprocess.STDOUT, start_new_session=True,
+    )
+    PID_FILE.write_text(str(proc.pid))
+    info(f"PID {proc.pid} — waiting for it to become healthy…")
+
+    # Poll health. First run may download the model, so wait generously.
+    for i in range(600):  # ~10 min
+        if proc.poll() is not None:
+            err("Server process died during startup. Last log lines:")
+            _tail(LOG_FILE, 20)
+            return False
+        if is_healthy(host, port):
+            console.print()
+            ok(f"MLX server is UP and HEALTHY 🟢  →  http://{host}:{port}")
+            return True
+        console.print(f"  [dim]…still warming up ({i}s)[/]", end="\r")
+        time.sleep(1)
+    err("Server did not become healthy in time. Check: ./mlx-pi logs")
+    return False
+
+def cmd_down(args) -> None:
+    pid = server_pid()
+    if not pid:
+        info("No running server tracked. (Already off 🔴)")
+        PID_FILE.unlink(missing_ok=True)
+        return
+    info(f"Stopping MLX server (PID {pid})…")
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        pass
+    for _ in range(10):
+        if server_pid() is None:
+            break
+        time.sleep(1)
+    if server_pid() is not None:
+        warn("Graceful stop timed out — force killing.")
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    PID_FILE.unlink(missing_ok=True)
+    ok("MLX server stopped 🔴")
+
+def cmd_restart(args) -> None:
+    cmd_down(args)
+    cmd_up(args)
+
+def cmd_status(args) -> None:
+    host, port = args.host, args.port
+    t = Table(show_header=False, box=None, pad_edge=False)
+    t.add_column(style="bold cyan")
+    t.add_column()
+    pid = server_pid()
+    t.add_row("endpoint", f"http://{host}:{port}")
+    t.add_row("process", f"[green]running[/] (PID {pid})" if pid else "[red]not running[/]")
+    t.add_row("health", "[green]healthy 🟢[/]" if is_healthy(host, port) else "[red]not responding 🔴[/]")
+    t.add_row("log", str(LOG_FILE))
+    console.print("[bold]MLX server status[/]")
+    console.print(t)
+
+def cmd_logs(args) -> None:
+    if not LOG_FILE.exists():
+        warn(f"No log yet at {LOG_FILE}")
+        return
+    info(f"Tailing {LOG_FILE} (Ctrl-C to stop; server keeps running)…")
+    # Hand off to `tail -f` for a proper follow.
+    os.execvp("tail", ["tail", "-n", "50", "-f", str(LOG_FILE)])
+
+def cmd_run(args) -> None:
+    """Foreground server (blocks). Good for debugging."""
+    require_mlx()
+    model = resolve_model(args)
+    if not confirm_download(model, args.yes):
+        warn("Not starting server.")
+        return
+    info(f"Running MLX server in the FOREGROUND (Ctrl-C to stop): {model}")
+    os.execvp(server_bin(), [server_bin(), "--model", model,
+              "--host", args.host, "--port", str(args.port),
+              "--max-tokens", str(DEFAULT_MAX_TOKENS)])
+
+def cmd_pi(args) -> None:
+    if not have("pi"):
+        err("pi not found. Run './mlx-pi setup' first.")
+        sys.exit(1)
+    # Ordering guarantee: bring the engine up (idempotent) BEFORE pi starts.
+    if not cmd_up(args):
+        return
+    console.print()
+    info("Launching pi. Inside pi: [bold]/model[/] → pick [bold]local-mlx[/] if needed.")
+    info("Leaving pi (/exit) keeps the server running.")
+    console.print()
+    os.execvp("pi", ["pi"])
+
+
+# ============================================================================
+#  SUBCOMMAND: plist  (generate, do NOT install)
+# ============================================================================
+
+PLIST_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  com.mlx-pi.server.plist — generated by `mlx-pi plist`.
+  This file is NOT installed. To enable auto-start at login:
+      cp com.mlx-pi.server.plist ~/Library/LaunchAgents/
+      launchctl load   ~/Library/LaunchAgents/com.mlx-pi.server.plist   # enable
+      launchctl unload ~/Library/LaunchAgents/com.mlx-pi.server.plist   # disable
+  Edit --model / --port below if you want different values.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.mlx-pi.server</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{server_bin}</string>
+        <string>--model</string>
+        <string>{model}</string>
+        <string>--host</string>
+        <string>{host}</string>
+        <string>--port</string>
+        <string>{port}</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>{home}/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>HF_HOME</key>
+        <string>{home}/.cache/huggingface</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>{state}/launchd.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>{state}/launchd.err.log</string>
+    <key>Nice</key>
+    <integer>5</integer>
+</dict>
+</plist>
+"""
+
+def cmd_plist(args) -> None:
+    model = resolve_model(args)
+    out = Path(args.output)
+    content = PLIST_TEMPLATE.format(
+        server_bin=server_bin(),
+        model=model,
+        host=args.host,
+        port=args.port,
+        home=str(Path.home()),
+        state=str(STATE_DIR),
+    )
+    out.write_text(content)
+    ok(f"Wrote personalized launchd plist → {out}")
+    info("It is NOT installed. To enable auto-start at login:")
+    console.print(f"  [cyan]cp {out} ~/Library/LaunchAgents/[/]")
+    console.print(f"  [cyan]launchctl load ~/Library/LaunchAgents/{out.name}[/]")
+    console.print(f"  [dim]Disable later: launchctl unload ~/Library/LaunchAgents/{out.name}[/]")
+    warn("A launchd server is always-on and holds the model in RAM from login. "
+         "On a laptop you may prefer manual ./mlx-pi up / down.")
+
+
+# ============================================================================
+#  Argument parsing / dispatch
+# ============================================================================
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="mlx-pi",
+        description="Run local LLMs on Apple Silicon with MLX + the pi agent.",
+    )
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    def server_opts(sp):
+        sp.add_argument("--host", default=DEFAULT_HOST, help=f"bind address (default {DEFAULT_HOST})")
+        sp.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"port (default {DEFAULT_PORT})")
+        sp.add_argument("-y", "--yes", action="store_true", help="skip the download-size prompt")
+
+    sp = sub.add_parser("setup", help="install mlx-lm + pi and configure everything")
+    add_model_flags(sp); server_opts(sp)
+    sp.add_argument("-p", "--prefetch", action="store_true", help="download the model now (with size check)")
+    sp.set_defaults(func=cmd_setup)
+
+    sp = sub.add_parser("up", help="start the MLX server in the background")
+    add_model_flags(sp); server_opts(sp); sp.set_defaults(func=lambda a: cmd_up(a))
+
+    sp = sub.add_parser("down", help="stop the background server")
+    server_opts(sp); sp.set_defaults(func=cmd_down)
+
+    sp = sub.add_parser("restart", help="restart the background server")
+    add_model_flags(sp); server_opts(sp); sp.set_defaults(func=cmd_restart)
+
+    sp = sub.add_parser("status", help="show running state + health")
+    server_opts(sp); sp.set_defaults(func=cmd_status)
+
+    sp = sub.add_parser("logs", help="tail the server log")
+    sp.set_defaults(func=cmd_logs)
+
+    sp = sub.add_parser("run", help="run the server in the foreground")
+    add_model_flags(sp); server_opts(sp); sp.set_defaults(func=cmd_run)
+
+    sp = sub.add_parser("pi", help="ensure server is up, then launch pi")
+    add_model_flags(sp); server_opts(sp); sp.set_defaults(func=cmd_pi)
+
+    sp = sub.add_parser("plist", help="generate a launchd plist (does not install)")
+    add_model_flags(sp); server_opts(sp)
+    sp.add_argument("-o", "--output", default="com.mlx-pi.server.plist", help="output path")
+    sp.set_defaults(func=cmd_plist)
+
+    return p
+
+def main() -> None:
+    args = build_parser().parse_args()
+    try:
+        args.func(args)
+    except KeyboardInterrupt:
+        console.print("\n[dim]interrupted[/]")
+        sys.exit(130)
+
+if __name__ == "__main__":
+    main()
