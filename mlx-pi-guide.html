@@ -305,7 +305,7 @@ flowchart TB
 <!-- ============================ STEPS ============================ -->
 <section id="steps">
   <h2><span class="num">4</span>Step by step — exactly what each command does</h2>
-  <p class="lead">These are the raw commands <code class="inline">./mlx-pi setup</code> (steps 1–4) and <code class="inline">./mlx-pi up</code> / <code class="inline">pi</code> (steps 5–6) run for you. Shown here so you understand every line.</p>
+  <p class="lead">These are the raw commands that <code class="inline">bootstrap.sh</code> + <code class="inline">./mlx-pi setup</code> (install &amp; configure) and <code class="inline">./mlx-pi up</code> / <code class="inline">pi</code> (serve &amp; run) carry out for you. Shown here so you understand every line. (<code class="inline">setup</code> also downloads on <code class="inline">--prefetch</code> and symlinks <code class="inline">mlx-pi</code> onto your PATH.)</p>
 
   <div class="step-h"><div class="dot">1</div><h3>Install uv</h3></div>
   <p><span class="pill once">one-time</span> Downloads a static binary; touches no system Python.</p>

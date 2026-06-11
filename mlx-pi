@@ -14,7 +14,8 @@
 #  then caches it. No virtualenv to manage.
 #
 #  SUBCOMMANDS
-#    setup     Install mlx-lm + pi, and point pi at the local server.
+#    setup     Install mlx-lm + pi, point pi at the local server (all
+#              downloaded models), and symlink mlx-pi onto your PATH.
 #    up        Start the MLX server in the background; wait until healthy.
 #    down      Stop the background server.
 #    restart   down + up.
@@ -884,7 +885,8 @@ def cmd_pi(args) -> None:
     if not cmd_up(args):
         return
     console.print()
-    info("Launching pi. Inside pi: [bold]/model[/] → pick [bold]local-mlx[/] if needed.")
+    info("Launching pi. Inside pi: [bold]/model[/] → switch between your "
+         "[bold]local-mlx[/] models.")
     info("Leaving pi (/exit) keeps the server running.")
     console.print()
     os.execvp("pi", ["pi"])

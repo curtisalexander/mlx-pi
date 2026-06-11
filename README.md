@@ -34,7 +34,9 @@ The default model is a small **Qwen3 4B** (~2 GB) so you can confirm the whole p
 | `bootstrap.sh` | ~5-line shell script. Installs `uv` and nothing else. Must be shell because a fresh Mac ships neither `uv` nor a reliable `python3`. |
 | `mlx-pi` | The single tool you actually use. A Python CLI run via `uv run` (deps `rich` + `httpx` are declared inline and built automatically on first run). |
 | `mlx-pi-guide.html` | Self-contained visual guide with diagrams. |
+| `index.html` | Redirect to the guide, so GitHub Pages serves it at the repo's Pages URL. |
 | `README.md` | This file. |
+| `LICENSE` | MIT license. |
 
 ---
 
@@ -162,6 +164,21 @@ launchctl unload ~/Library/LaunchAgents/com.mlx-pi.server.plist  # disable later
 | Out of memory / sluggish | Model too big for your RAM — use a smaller one and close heavy apps. |
 | Port already in use | `./mlx-pi up --port 8090` and re-run `./mlx-pi setup --port 8090`. |
 | Download very slow, or `401`/gated error | Set `HF_TOKEN` (see [Hugging Face authentication](#hugging-face-authentication-hf_token)) — auth raises rate limits and unlocks gated models. |
+
+---
+
+## Environment variables
+
+All optional — sensible defaults otherwise.
+
+| Variable | Effect |
+|----------|--------|
+| `MLX_MODEL` | Default model id when no `--model`/preset flag is given (persists your choice across `up`/`pi`/`setup`). |
+| `MLX_STATE_DIR` | Where the PID file and server log live (default `~/.mlx-pi`). |
+| `MLX_LOG_MAX_BYTES` | Cap for `server.log` before it's trimmed (default `10485760` = 10 MB). |
+| `MLX_STARTUP_TIMEOUT` | Seconds `up` waits for the server to become healthy before giving up (default `600`). |
+| `HF_TOKEN` | Hugging Face token for gated models / higher download rate limits (see above). |
+| `HF_HOME` / `HF_HUB_CACHE` | Relocate the Hugging Face cache; `mlx-pi` honors these when finding downloaded models. |
 
 ---
 
