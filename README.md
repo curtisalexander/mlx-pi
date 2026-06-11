@@ -108,7 +108,7 @@ Examples:
 
 **Before downloading anything**, the tool queries Hugging Face for the exact size, prints the download size + a rough RAM estimate, warns if it exceeds your memory, and asks you to confirm (default **No**). Add `-y`/`--yes` to skip the prompt. If the model is already cached, it proceeds silently.
 
-Run **`./mlx-pi models`** any time to see the presets, which are downloaded (with on-disk size — partial/interrupted downloads are flagged as `⏳ partial`), and which one pi is currently configured to call. Use **`./mlx-pi models pull [flags]`** to download one ahead of time (resumes partials), **`./mlx-pi models rm [flags]`** to delete one and reclaim disk, and **`./mlx-pi models clean`** to sweep stale `*.incomplete` temp files left by interrupted downloads (it keeps any download still in progress).
+Run **`./mlx-pi models`** any time to see the presets, which are downloaded (with on-disk size — partial/interrupted downloads are flagged as `⏳ partial`), and which one pi is currently configured to call. Use **`./mlx-pi models pull <id|flags>`** to download one ahead of time (resumes partials), **`./mlx-pi models rm <id|flags>`** to delete one and reclaim disk, and **`./mlx-pi models clean`** to sweep stale `*.incomplete` temp files left by interrupted downloads (it keeps any download still in progress). `pull`/`rm` accept either a preset flag (`--qwen-coder`) or a model id directly, e.g. `./mlx-pi models rm mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit`.
 
 ### Multiple models in pi
 

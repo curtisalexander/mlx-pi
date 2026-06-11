@@ -226,6 +226,10 @@ def resolve_model(args) -> str:
         return args.model
     return os.environ.get("MLX_MODEL", DEFAULT_MODEL)
 
+def resolve_target_model(args) -> str:
+    """Like resolve_model, but a positional REPO_ID (on `models pull`/`rm`) wins."""
+    return getattr(args, "repo", None) or resolve_model(args)
+
 def add_model_flags(p: argparse.ArgumentParser) -> None:
     """Attach the common model-selection flags to a subparser."""
     p.add_argument("-m", "--model", metavar="REPO_ID",
@@ -715,7 +719,8 @@ def cmd_models(args) -> None:
         for repo in others:
             o.add_row(repo, _download_cell(repo), pi_cell(repo))
         console.print(o)
-        console.print("  [dim]Use any of these with [cyan]mlx-pi up --model <id>[/].[/]")
+        console.print("  [dim]Use any with [cyan]mlx-pi up --model <id>[/] · "
+                      "remove with [cyan]mlx-pi models rm <id>[/][/]")
 
     if configured and model_status(configured) == "partial":
         console.print()
@@ -747,7 +752,7 @@ def _pull_done(model: str, verb: str) -> None:
         info(f"pi now sees [bold]{n}[/] model(s) — restart pi (or /model) to pick it up.")
 
 def cmd_models_pull(args) -> None:
-    model = resolve_model(args)
+    model = resolve_target_model(args)
     status = model_status(model)
     if status == "complete":
         _pull_done(model, "Already downloaded")
@@ -765,7 +770,7 @@ def cmd_models_pull(args) -> None:
              "re-run 'mlx-pi models pull' to retry.")
 
 def cmd_models_rm(args) -> None:
-    model = resolve_model(args)
+    model = resolve_target_model(args)
     base = HF_CACHE / f"models--{model.replace('/', '--')}"
     if not base.is_dir():
         warn(f"Not in cache — nothing to remove: {model}")
@@ -1116,10 +1121,14 @@ def build_parser() -> argparse.ArgumentParser:
     lp = msub.add_parser("list", help="list preset + downloaded models")
     lp.set_defaults(func=cmd_models)
     pp = msub.add_parser("pull", help="download a model to the cache (no server)")
+    pp.add_argument("repo", nargs="?", metavar="REPO_ID",
+                    help="model id to download (or use a preset flag below)")
     add_model_flags(pp)
     pp.add_argument("-y", "--yes", action="store_true", help="skip the download-size prompt")
     pp.set_defaults(func=cmd_models_pull)
     rp = msub.add_parser("rm", help="delete a model from the cache to free disk")
+    rp.add_argument("repo", nargs="?", metavar="REPO_ID",
+                    help="model id to delete (or use a preset flag below)")
     add_model_flags(rp)
     rp.add_argument("-y", "--yes", action="store_true", help="skip the delete confirmation")
     rp.set_defaults(func=cmd_models_rm)
