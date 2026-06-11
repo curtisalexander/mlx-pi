@@ -20,6 +20,7 @@
 #    restart   down + up.
 #    status    Show running state + health.
 #    logs      Tail the server log.
+#    models    List preset + downloaded models (and what pi is set to use).
 #    run       Run the server in the FOREGROUND (Ctrl-C to stop).
 #    pi        Ensure the server is up, then launch the pi agent.
 #    plist     Generate a personalized launchd plist (does NOT install it).
@@ -62,6 +63,13 @@ console = Console()
 DEFAULT_MODEL = "mlx-community/Qwen3-4B-Instruct-2507-4bit"
 QWEN_CODER_MODEL = "mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit"  # ~16 GB
 GEMMA_MODEL = "mlx-community/gemma-4-26b-a4b-it-4bit"                 # ~15.6 GB, text+image
+
+# The built-in presets, shown by `mlx-pi models`: (flag, repo id, modality).
+PRESETS = [
+    ("(default)", DEFAULT_MODEL, "text"),
+    ("--qwen-coder", QWEN_CODER_MODEL, "text"),
+    ("--gemma", GEMMA_MODEL, "text+image"),
+]
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8080
@@ -478,6 +486,85 @@ def cmd_status(args) -> None:
     console.print("[bold]MLX server status[/]")
     console.print(t)
 
+def cache_size_bytes(repo: str) -> int | None:
+    """On-disk size of a cached model (sum of its blob files). None if absent."""
+    blobs = HF_CACHE / f"models--{repo.replace('/', '--')}" / "blobs"
+    if not blobs.is_dir():
+        return None
+    total = 0
+    for f in blobs.iterdir():
+        try:
+            total += f.stat().st_size
+        except OSError:
+            pass
+    return total
+
+def configured_model_id() -> str | None:
+    """The model id pi is currently pointed at (from models.json), if any."""
+    try:
+        data = json.loads(PI_CONFIG_FILE.read_text())
+        models = data["providers"][PI_PROVIDER_ID]["models"]
+        return models[0]["id"] if models else None
+    except Exception:
+        return None
+
+def _cached_repo_ids() -> list[str]:
+    """MLX models fully present in the local HF cache (populated snapshot), as
+    repo ids. Mirrors model_is_cached so partial downloads aren't counted."""
+    if not HF_CACHE.is_dir():
+        return []
+    out = []
+    for d in HF_CACHE.iterdir():
+        if d.is_dir() and d.name.startswith("models--"):
+            repo = d.name[len("models--"):].replace("--", "/")
+            if model_is_cached(repo):
+                out.append(repo)
+    return out
+
+def _gb(n: int | None) -> str:
+    return f"{n / 1024 ** 3:.1f} GB" if n else "—"
+
+def cmd_models(args) -> None:
+    configured = configured_model_id()
+    cached = set(_cached_repo_ids())
+    preset_ids = {repo for _, repo, _ in PRESETS}
+
+    t = Table(title="Presets", title_justify="left", title_style="bold",
+              box=None, pad_edge=False)
+    t.add_column("Flag", style="cyan", no_wrap=True)
+    t.add_column("Model", style="white", overflow="fold")
+    t.add_column("Type", style="dim")
+    t.add_column("Downloaded")
+    t.add_column("pi", justify="center")
+    for flag, repo, modality in PRESETS:
+        on_disk = repo in cached
+        dl = f"[green]✅ {_gb(cache_size_bytes(repo))}[/]" if on_disk else "[dim]— not yet[/]"
+        active = "[bold green]▸[/]" if repo == configured else ""
+        t.add_row(flag, repo, modality, dl, active)
+    console.print(t)
+    console.print("  [dim]▸ = what pi is configured to call · "
+                  "download happens on first [cyan]mlx-pi up[/] (or [cyan]setup -p[/])[/]")
+
+    # Any other cached MLX models that aren't presets — still usable via --model.
+    others = sorted(cached - preset_ids)
+    if others:
+        console.print()
+        o = Table(title="Other downloaded models", title_justify="left",
+                  title_style="bold", box=None, pad_edge=False)
+        o.add_column("Model", style="white", overflow="fold")
+        o.add_column("Downloaded")
+        o.add_column("pi", justify="center")
+        for repo in others:
+            o.add_row(repo, f"[green]✅ {_gb(cache_size_bytes(repo))}[/]",
+                      "[bold green]▸[/]" if repo == configured else "")
+        console.print(o)
+        console.print("  [dim]Use any of these with [cyan]mlx-pi up --model <id>[/].[/]")
+
+    if configured and configured not in cached:
+        console.print()
+        warn(f"pi is configured for [bold]{configured}[/], which isn't downloaded yet — "
+             "it'll be fetched on the next 'up' (with a size prompt).")
+
 def trim_log() -> None:
     """Cap server.log: if it exceeds LOG_MAX_BYTES, keep only the most recent
     half (snapped to a line boundary) and drop the older head. Best-effort —
@@ -731,6 +818,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("logs", help="tail the server log")
     sp.set_defaults(func=cmd_logs)
 
+    sp = sub.add_parser("models", help="list preset + downloaded models")
+    sp.set_defaults(func=cmd_models)
+
     sp = sub.add_parser("run", help="run the server in the foreground")
     add_model_flags(sp); server_opts(sp); sp.set_defaults(func=cmd_run)
 
@@ -773,6 +863,7 @@ def print_overview() -> None:
         ("Inspect", [
             ("status", "show running state + health"),
             ("logs", "tail the server log"),
+            ("models", "list preset + downloaded models"),
         ]),
         ("Agent & install", [
             ("setup", "install mlx-lm + pi, configure, symlink mlx-pi onto PATH"),
