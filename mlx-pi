@@ -249,6 +249,27 @@ def is_healthy(host: str, port: int) -> bool:
     except Exception:
         return False
 
+def served_model(pid: int) -> str | None:
+    """The model the running server was launched with, read from its argv. The
+    /v1/models endpoint lists every cached model (mlx_lm can hot-swap per
+    request), so it can't tell us the loaded one — the process args can."""
+    try:
+        out = subprocess.check_output(["ps", "-p", str(pid), "-o", "command="], text=True)
+    except Exception:
+        return None
+    parts = out.split()
+    if "--model" in parts:
+        i = parts.index("--model")
+        if i + 1 < len(parts):
+            return parts[i + 1]
+    return None
+
+def _model_requested(args) -> bool:
+    """True if the user explicitly chose a model (flag or MLX_MODEL), vs the
+    implicit default — so we only warn about a mismatch when they actually asked."""
+    return bool(getattr(args, "qwen_coder", False) or getattr(args, "gemma", False)
+                or getattr(args, "model", None) or os.environ.get("MLX_MODEL"))
+
 def server_bin() -> str:
     """Absolute path to mlx_lm.server (uv installs it to ~/.local/bin)."""
     return have("mlx_lm.server") or str(Path.home() / ".local" / "bin" / "mlx_lm.server")
@@ -404,7 +425,14 @@ def cmd_up(args) -> bool:
     pid = server_pid()
     if pid:
         if is_healthy(host, port):
-            ok(f"MLX server already up & healthy at http://{host}:{port}")
+            ok(f"MLX server is already up & healthy 🟢  →  http://{host}:{port}")
+            served = served_model(pid)
+            if served:
+                info(f"Currently serving: [bold]{served}[/]")
+                if _model_requested(args) and served != model:
+                    warn(f"It was started with [bold]{served}[/], not the "
+                         f"[bold]{model}[/] you asked for. To serve that, run "
+                         f"[bold]mlx-pi restart[/] with your model flag.")
             return True
         warn("Server process exists but isn't answering — restarting it.")
         cmd_down(args)

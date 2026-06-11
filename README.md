@@ -100,7 +100,7 @@ Examples:
 > - **During setup:** add `-p`/`--prefetch` — `./mlx-pi setup --qwen-coder -p`.
 > - **Lazily:** the first `./mlx-pi up --qwen-coder` fetches it as the server boots.
 >
-> Either way, **pass the same model flag to `up`** — it does *not* inherit `setup`'s choice, so `./mlx-pi up --qwen-coder` (or persist it with `export MLX_MODEL=<id>`), else it serves the default 4B and mismatches what pi calls.
+> Either way, **pass the same model flag to `up`** — it does *not* inherit `setup`'s choice, so `./mlx-pi up --qwen-coder` (or persist it with `export MLX_MODEL=<id>`), else it serves the default 4B and mismatches what pi calls. If the server is **already running**, `up`/`pi` report which model it's serving and warn you (with the fix: `./mlx-pi restart --<flag>`) when it differs from the one you asked for.
 
 **Before downloading anything**, the tool queries Hugging Face for the exact size, prints the download size + a rough RAM estimate, warns if it exceeds your memory, and asks you to confirm (default **No**). Add `-y`/`--yes` to skip the prompt. If the model is already cached, it proceeds silently.
 
