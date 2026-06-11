@@ -71,6 +71,9 @@ PI_CONFIG_FILE = PI_CONFIG_DIR / "models.json"
 STATE_DIR = Path(os.environ.get("MLX_STATE_DIR", Path.home() / ".mlx-pi"))
 PID_FILE = STATE_DIR / "server.pid"
 LOG_FILE = STATE_DIR / "server.log"
+# The log is appended to across every `up`, so cap its size. When it exceeds
+# this, we keep the most recent half and drop the older head.
+LOG_MAX_BYTES = 10 * 1024 * 1024  # 10 MB
 
 # npm package for the pi coding agent (latest recommended install).
 PI_NPM_PKG = "@earendil-works/pi-coding-agent"
@@ -387,6 +390,7 @@ def cmd_up(args) -> bool:
         return False
 
     STATE_DIR.mkdir(parents=True, exist_ok=True)
+    trim_log()
     info("Starting MLX server (background daemon)…")
     info(f"  model: [bold]{model}[/]   bind: [bold]{host}:{port}[/]")
     info(f"  log  : {LOG_FILE}")
@@ -457,6 +461,27 @@ def cmd_status(args) -> None:
     t.add_row("log", str(LOG_FILE))
     console.print("[bold]MLX server status[/]")
     console.print(t)
+
+def trim_log() -> None:
+    """Cap server.log: if it exceeds LOG_MAX_BYTES, keep only the most recent
+    half (snapped to a line boundary) and drop the older head. Best-effort —
+    any error here must never block starting the server."""
+    try:
+        if not LOG_FILE.exists() or LOG_FILE.stat().st_size <= LOG_MAX_BYTES:
+            return
+        keep = LOG_MAX_BYTES // 2
+        with open(LOG_FILE, "rb") as f:
+            f.seek(-keep, os.SEEK_END)
+            tail = f.read()
+        # Drop the partial first line so the kept log starts cleanly.
+        nl = tail.find(b"\n")
+        if nl != -1:
+            tail = tail[nl + 1:]
+        with open(LOG_FILE, "wb") as f:
+            f.write(b"--- log trimmed (exceeded %d bytes) ---\n" % LOG_MAX_BYTES)
+            f.write(tail)
+    except OSError:
+        pass
 
 def cmd_logs(args) -> None:
     if not LOG_FILE.exists():
