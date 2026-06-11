@@ -514,6 +514,16 @@ def configured_model_ids() -> list[str]:
     except Exception:
         return []
 
+def align_pi_default(model: str, port: int) -> int | None:
+    """Make `model` pi's startup default: register it (or create the provider
+    config if pi isn't set up yet) and set it as defaultModel. Returns pi's
+    model count. The single place the 'point pi at this model' step lives, so
+    `use` and `pi --<model>` behave identically."""
+    if PI_CONFIG_FILE.exists():
+        return refresh_pi_models(primary=model, force_primary=True)
+    configure_pi(model, f"http://localhost:{port}/v1")
+    return len(configured_model_ids())
+
 
 # ============================================================================
 #  Server process management (PID file + health checks + log helpers)
@@ -715,17 +725,22 @@ def cmd_up(args) -> bool:
 
     pid = server_pid()
     if pid:
-        if is_healthy(host, port):
+        healthy = is_healthy(host, port)
+        served = served_model(pid) if healthy else None
+        # If the user explicitly asked for a different model than the one running,
+        # honor it: restart onto it instead of just warning. (A bare `up` with no
+        # model request leaves the running server alone — no surprise reload.)
+        switch = bool(_model_requested(args) and served and served != model)
+        if healthy and not switch:
             ok(f"MLX server is already up & healthy 🟢  →  http://{host}:{port}")
-            served = served_model(pid)
             if served:
                 info(f"Currently serving: [bold]{served}[/]")
-                if _model_requested(args) and served != model:
-                    warn(f"It was started with [bold]{served}[/], not the "
-                         f"[bold]{model}[/] you asked for. To serve that, run "
-                         f"[bold]mlx-pi restart[/] with your model flag.")
             return True
-        warn("Server process exists but isn't answering — restarting it.")
+        if switch:
+            info(f"Server is serving [bold]{served}[/], but you asked for "
+                 f"[bold]{model}[/] — restarting onto it.")
+        else:
+            warn("Server process exists but isn't answering — restarting it.")
         cmd_down(args)
 
     if not confirm_download(model, args.yes):
@@ -824,12 +839,7 @@ def cmd_use(args) -> None:
         return
 
     # 3. Point pi's default at the same model (pinned → only it).
-    base_url = f"http://localhost:{args.port}/v1"
-    if PI_CONFIG_FILE.exists():
-        n = refresh_pi_models(primary=model, force_primary=True)
-    else:
-        configure_pi(model, base_url)
-        n = len(configured_model_ids())
+    n = align_pi_default(model, args.port)
     if n is not None:
         tag = "  [dim](pinned)[/]" if _pin_enabled() else ""
         ok(f"Server and pi are now both on [bold]{model}[/] — pi sees {n} model(s).{tag}")
@@ -905,6 +915,13 @@ def cmd_pi(args) -> None:
     # Ordering guarantee: bring the engine up (idempotent) BEFORE pi starts.
     if not cmd_up(args):
         return
+    # If a model was explicitly requested (e.g. `pi --gemma`), make it pi's
+    # default too, so pi opens on the same model the server now serves.
+    if _model_requested(args):
+        model = resolve_model(args)
+        if configured_model_id() != model:
+            align_pi_default(model, args.port)
+            info(f"pi will open on [bold]{model}[/].")
     console.print()
     info("Launching pi. Inside pi: [bold]/model[/] → switch between your "
          "[bold]local-mlx[/] models.")

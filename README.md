@@ -106,7 +106,7 @@ Examples:
 > - **During setup:** add `-p`/`--prefetch` — `./mlx-pi setup --qwen-coder -p`.
 > - **Lazily:** the first `./mlx-pi up --qwen-coder` fetches it as the server boots.
 >
-> Either way, **pass the same model flag to `up`** — it does *not* inherit `setup`'s choice, so `./mlx-pi up --qwen-coder` (or persist it with `export MLX_MODEL=<id>`), else it serves the default 4B and mismatches what pi calls. If the server is **already running**, `up`/`pi` report which model it's serving and warn you (with the fix: `./mlx-pi restart --<flag>`) when it differs from the one you asked for.
+> Either way, **pass the same model flag to `up`/`pi`** — they do *not* inherit `setup`'s choice, so use `./mlx-pi up --qwen-coder` (or persist it with `export MLX_MODEL=<id>`), else the default 4B is served and mismatches what pi calls. If the server is **already running on a different model**, an explicit flag now makes `up`/`pi` **restart it onto the model you asked for** (a bare `up` with no flag leaves the running server alone). `pi --<flag>` also points pi's default at that model, so server and pi open in lockstep.
 
 **Before downloading anything**, the tool queries Hugging Face for the exact size, prints the download size + a rough RAM estimate, warns if it exceeds your memory, and asks you to confirm (default **No**). Add `-y`/`--yes` to skip the prompt. If the model is already cached, it proceeds silently.
 
@@ -127,10 +127,11 @@ pi can use **every model you've downloaded**, not just the one from `setup`. The
 
 The MLX server is launched with **one** model (its `--model`), but that's only a *preload/default*: `mlx_lm.server` **hot-swaps to whatever model a request names**. So when you `/model` to a different model inside pi, the server reloads that model on the fly. You won't get the wrong weights — but the swap costs a reload (seconds for small models, much longer for big ones) and the new model's RAM. The drift to watch for is *operational*, not correctness.
 
-There are two separate things to keep aligned: which model the **server preloaded** (its `--model`) and which model **pi opens on**. pi's startup model lives in `~/.pi/agent/settings.json` (`defaultProvider` + `defaultModel`) — **not** in the order of the `models.json` list — so changing it means writing that file, which `setup` and `use` do for you.
+There are two separate things to keep aligned: which model the **server preloaded** (its `--model`) and which model **pi opens on**. pi's startup model lives in `~/.pi/agent/settings.json` (`defaultProvider` + `defaultModel`) — **not** in the order of the `models.json` list — so changing it means writing that file, which `setup`, `use`, and `pi --<model>` do for you.
 
+- **`./mlx-pi up --<model>` / `pi --<model>`** — when an explicit model differs from the one a running server has, they **restart the server onto it** instead of just warning (a bare `up` leaves the running server alone). `pi --<model>` additionally sets pi's `defaultModel`, so the server and pi open on the same model.
+- **`./mlx-pi use <model>`** moves both sides together *without launching pi*: downloads if needed, restarts the server on it, and sets it as pi's `defaultModel`. The deliberate "switch everything to this model" command.
 - **`./mlx-pi status`** shows the **preloaded** model and **pi's default** side by side, and warns when they differ (pi's first request would force a reload). It can't show the *currently-resident* model after a swap — `mlx_lm.server` neither exposes nor logs it.
-- **`./mlx-pi use <model>`** is the one command that moves both sides together: it downloads the model if needed, restarts the server on it, and sets it as pi's `defaultModel`. Use this instead of `up --model X` when you want pi and the server to agree.
 - **Pinned mode** (`--pin` on `setup`/`use`, or `export MLX_PIN_MODEL=1`) registers **only** the served model with pi, so pi's picker can't drift to something that triggers a surprise reload. Good default on low-RAM machines.
 - **RAM guard** (on by default) hides models from pi's picker that clearly won't fit in your installed RAM, so selecting one can't OOM the box. The model you explicitly chose is always kept, and hidden models are reported (not silently dropped). Disable with `export MLX_NO_RAM_GUARD=1`.
 

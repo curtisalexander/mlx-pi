@@ -226,6 +226,23 @@ def force_primary_moves_default_plain_refresh_does_not():
     assert m.configured_model_id() == "org/b"
 
 @test
+def align_pi_default_configures_when_unset():
+    c = fresh_cache(); fresh_pi()
+    make_model(c, "org/a"); make_model(c, "org/b")
+    # pi not configured yet → align should create the provider + set the default
+    n = m.align_pi_default("org/b", 8080)
+    assert n == 2
+    assert m.configured_model_id() == "org/b"
+
+@test
+def align_pi_default_switches_existing():
+    c = fresh_cache(); fresh_pi()
+    make_model(c, "org/a"); make_model(c, "org/b")
+    m.configure_pi("org/a", "http://localhost:8080/v1")   # default = org/a
+    m.align_pi_default("org/b", 8080)
+    assert m.configured_model_id() == "org/b"             # moved to org/b
+
+@test
 def set_pi_default_preserves_other_settings():
     fresh_pi()
     m.PI_SETTINGS_FILE.write_text('{"defaultThinkingLevel": "high", "packages": ["x"]}')
