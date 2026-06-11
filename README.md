@@ -65,6 +65,7 @@ You ──run──▶ ./mlx-pi pi ──HTTP /v1/chat/completions──▶ MLX 
 ./mlx-pi models pull  Download a model to the cache (no server; resumes partials).
 ./mlx-pi models rm    Delete a model from the cache to free disk.
 ./mlx-pi models clean Remove stale *.incomplete temp files (keeps active downloads).
+./mlx-pi models sync  Register all downloaded models with pi (so pi's /model lists them).
 ./mlx-pi run        Run the server in the FOREGROUND (Ctrl-C to stop).
 ./mlx-pi pi         Ensure the server is up, then launch the pi agent.
 ./mlx-pi plist      Generate a launchd plist for auto-start (does NOT install it).
@@ -105,6 +106,16 @@ Examples:
 **Before downloading anything**, the tool queries Hugging Face for the exact size, prints the download size + a rough RAM estimate, warns if it exceeds your memory, and asks you to confirm (default **No**). Add `-y`/`--yes` to skip the prompt. If the model is already cached, it proceeds silently.
 
 Run **`./mlx-pi models`** any time to see the presets, which are downloaded (with on-disk size — partial/interrupted downloads are flagged as `⏳ partial`), and which one pi is currently configured to call. Use **`./mlx-pi models pull [flags]`** to download one ahead of time (resumes partials), **`./mlx-pi models rm [flags]`** to delete one and reclaim disk, and **`./mlx-pi models clean`** to sweep stale `*.incomplete` temp files left by interrupted downloads (it keeps any download still in progress).
+
+### Multiple models in pi
+
+pi can use **every model you've downloaded**, not just the one from `setup`. The `local-mlx` provider in `~/.pi/agent/models.json` is registered with all your downloaded models, so inside pi you can `/model` between them. The list stays in sync automatically: `setup` and `models pull` register newly-downloaded models, and `models rm` removes them. If you ever download a model another way (or pi's list looks stale), run:
+
+```bash
+./mlx-pi models sync     # rebuild pi's model list from what's in the cache
+```
+
+The model you passed to `setup` (or the existing default) stays pi's **default**; the rest are selectable via `/model`. Restart pi — or use `/model` — to pick up changes made while it's running. In `./mlx-pi models`, the `pi` column shows `▸` for pi's default and `✓` for the other models pi can use.
 
 ### Hugging Face authentication (`HF_TOKEN`)
 

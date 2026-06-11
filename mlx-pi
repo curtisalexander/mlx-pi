@@ -20,7 +20,7 @@
 #    restart   down + up.
 #    status    Show running state + health.
 #    logs      Tail the server log.
-#    models    List models; pull/rm/clean download, delete, or prune temp files.
+#    models    List/pull/rm/clean/sync models (sync = register all with pi).
 #    run       Run the server in the FOREGROUND (Ctrl-C to stop).
 #    pi        Ensure the server is up, then launch the pi agent.
 #    plist     Generate a personalized launchd plist (does NOT install it).
@@ -356,24 +356,46 @@ def cmd_setup(args) -> None:
 
     _print_setup_summary(model, linked=linked)
 
+def _pi_multimodal(repo: str) -> bool:
+    """Best-effort: which models accept image input (so pi advertises it)."""
+    r = repo.lower()
+    return repo == GEMMA_MODEL or "gemma-4" in r or "-vl" in r or "vision" in r
+
+def _pi_model_entry(repo: str) -> dict:
+    """One pi models.json entry for a model repo id."""
+    return {
+        "id": repo,
+        "name": f"MLX · {repo.split('/')[-1]}",
+        "reasoning": False,
+        "input": ["text", "image"] if _pi_multimodal(repo) else ["text"],
+        "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+        "contextWindow": 131072,
+        "maxTokens": 8192,
+    }
+
+def _pi_model_ids(primary: str | None = None, force_primary: bool = False) -> list[str]:
+    """Repo ids to expose to pi: `primary` first (if forced, or already
+    downloaded), then every other fully-downloaded model in the cache. So pi
+    sees every model you've installed and defaults to the one you chose."""
+    complete = sorted(r for r in _present_repo_ids() if model_status(r) == "complete")
+    ids: list[str] = []
+    if primary and (force_primary or primary in complete):
+        ids.append(primary)
+    for r in complete:
+        if r not in ids:
+            ids.append(r)
+    return ids
+
 def configure_pi(model: str, base_url: str) -> None:
-    """Write/merge the local-mlx provider into pi's models.json (native JSON — no heredocs!)."""
+    """Write/merge the local-mlx provider into pi's models.json (native JSON — no
+    heredocs!). Registers every downloaded model, defaulting to `model`."""
     PI_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    # Gemma 4 is multimodal; others here are text-only.
-    inputs = ["text", "image"] if model == GEMMA_MODEL else ["text"]
+    ids = _pi_model_ids(primary=model, force_primary=True)
     provider = {
         "baseUrl": base_url,
         "api": "openai-completions",
         "apiKey": "local-mlx-no-key-needed",  # required by client, ignored by MLX
-        "models": [{
-            "id": model,
-            "name": f"MLX · {model.split('/')[-1]}",
-            "reasoning": False,
-            "input": inputs,
-            "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
-            "contextWindow": 131072,
-            "maxTokens": 8192,
-        }],
+        "models": [_pi_model_entry(r) for r in ids],
     }
     if PI_CONFIG_FILE.exists():
         backup = PI_CONFIG_FILE.with_suffix(f".json.bak.{int(time.time())}")
@@ -387,7 +409,29 @@ def configure_pi(model: str, base_url: str) -> None:
         data = {}
     data.setdefault("providers", {})[PI_PROVIDER_ID] = provider
     PI_CONFIG_FILE.write_text(json.dumps(data, indent=2))
-    ok(f"Configured provider '{PI_PROVIDER_ID}' → {base_url}")
+    ok(f"Configured provider '{PI_PROVIDER_ID}' with {len(ids)} model(s) → {base_url}")
+
+def refresh_pi_models(primary: str | None = None, force_primary: bool = False) -> int | None:
+    """Rewrite the local-mlx provider's model list from the cache, preserving its
+    baseUrl/api/key. Keeps the current default first unless `primary` is given.
+    Returns the new model count, or None if pi isn't configured yet."""
+    if not PI_CONFIG_FILE.exists():
+        return None
+    try:
+        data = json.loads(PI_CONFIG_FILE.read_text())
+    except Exception:
+        return None
+    prov = data.get("providers", {}).get(PI_PROVIDER_ID)
+    if not isinstance(prov, dict):
+        return None
+    if primary is None:  # keep the existing default model first, if still present
+        cur = prov.get("models") or []
+        if cur:
+            primary = cur[0].get("id")
+    ids = _pi_model_ids(primary=primary, force_primary=force_primary)
+    prov["models"] = [_pi_model_entry(r) for r in ids]
+    PI_CONFIG_FILE.write_text(json.dumps(data, indent=2))
+    return len(ids)
 
 def _print_setup_summary(model: str, linked: bool = True) -> None:
     p = "mlx-pi" if linked else "./mlx-pi"
@@ -530,13 +574,17 @@ def cache_size_bytes(repo: str) -> int | None:
     return total
 
 def configured_model_id() -> str | None:
-    """The model id pi is currently pointed at (from models.json), if any."""
+    """pi's default model (first in its list), if any."""
+    ids = configured_model_ids()
+    return ids[0] if ids else None
+
+def configured_model_ids() -> list[str]:
+    """Every model id registered with pi's local-mlx provider (default first)."""
     try:
         data = json.loads(PI_CONFIG_FILE.read_text())
-        models = data["providers"][PI_PROVIDER_ID]["models"]
-        return models[0]["id"] if models else None
+        return [m["id"] for m in data["providers"][PI_PROVIDER_ID]["models"]]
     except Exception:
-        return None
+        return []
 
 def _active_incomplete(blobs: Path) -> bool:
     """True if any *.incomplete temp is a genuinely in-progress download. A temp
@@ -602,8 +650,14 @@ def _download_cell(repo: str) -> str:
 
 def cmd_models(args) -> None:
     configured = configured_model_id()
+    registered = set(configured_model_ids())
     present = set(_present_repo_ids())
     preset_ids = {repo for _, repo, _ in PRESETS}
+
+    def pi_cell(repo: str) -> str:
+        if repo == configured:
+            return "[bold green]▸[/]"
+        return "[green]✓[/]" if repo in registered else ""
 
     t = Table(title="Presets", title_justify="left", title_style="bold",
               box=None, pad_edge=False)
@@ -613,11 +667,10 @@ def cmd_models(args) -> None:
     t.add_column("Downloaded")
     t.add_column("pi", justify="center")
     for flag, repo, modality in PRESETS:
-        active = "[bold green]▸[/]" if repo == configured else ""
-        t.add_row(flag, repo, modality, _download_cell(repo), active)
+        t.add_row(flag, repo, modality, _download_cell(repo), pi_cell(repo))
     console.print(t)
-    console.print("  [dim]▸ = what pi is configured to call · download with "
-                  "[cyan]mlx-pi models pull[/] (or it's fetched on first [cyan]up[/])[/]")
+    console.print("  [dim]pi: ▸ = default · ✓ = also available · download with "
+                  "[cyan]mlx-pi models pull[/], register with [cyan]mlx-pi models sync[/][/]")
 
     # Any other cached models that aren't presets — still usable via --model.
     others = sorted(present - preset_ids)
@@ -629,8 +682,7 @@ def cmd_models(args) -> None:
         o.add_column("Downloaded")
         o.add_column("pi", justify="center")
         for repo in others:
-            o.add_row(repo, _download_cell(repo),
-                      "[bold green]▸[/]" if repo == configured else "")
+            o.add_row(repo, _download_cell(repo), pi_cell(repo))
         console.print(o)
         console.print("  [dim]Use any of these with [cyan]mlx-pi up --model <id>[/].[/]")
 
@@ -653,12 +705,15 @@ def _hf_download(repo: str) -> None:
          "snapshot_download(sys.argv[1])", repo])
 
 def _pull_done(model: str, verb: str) -> None:
-    """Report a finished pull, pruning stale temp files and noting freed space."""
+    """Report a finished pull, prune stale temps, and register it with pi."""
     freed = prune_stale_incomplete(model)
     msg = f"{verb}: {model}  ({_size(cache_size_bytes(model))})"
     if freed:
         msg += f"  ·  cleaned up {_size(freed)} of leftover temp files"
     ok(msg)
+    n = refresh_pi_models()  # keeps pi's default; adds the now-complete model
+    if n is not None:
+        info(f"pi now sees [bold]{n}[/] model(s) — restart pi (or /model) to pick it up.")
 
 def cmd_models_pull(args) -> None:
     model = resolve_model(args)
@@ -693,6 +748,22 @@ def cmd_models_rm(args) -> None:
         return
     shutil.rmtree(base, ignore_errors=True)
     ok(f"Removed {model} — freed ~{_size(size)}.")
+    n = refresh_pi_models()  # drop it from pi's list too
+    if n is not None:
+        info(f"pi now sees {n} model(s).")
+
+def cmd_models_sync(args) -> None:
+    """Rebuild pi's model list from the downloaded models in the cache."""
+    n = refresh_pi_models()
+    if n is None:
+        warn("pi isn't configured yet — run 'mlx-pi setup' first.")
+        return
+    ids = configured_model_ids()
+    ok(f"pi now sees {n} model(s):")
+    for i, m in enumerate(ids):
+        tag = "  [dim](default)[/]" if i == 0 else ""
+        console.print(f"    [cyan]{m}[/]{tag}")
+    info("Restart pi (or use /model inside it) to pick up the change.")
 
 def cmd_models_clean(args) -> None:
     """Sweep stale *.incomplete temp files across every cached model. Safe:
@@ -1001,6 +1072,8 @@ def build_parser() -> argparse.ArgumentParser:
     rp.set_defaults(func=cmd_models_rm)
     cp = msub.add_parser("clean", help="remove stale *.incomplete temp files (frees disk)")
     cp.set_defaults(func=cmd_models_clean)
+    syp = msub.add_parser("sync", help="register all downloaded models with pi")
+    syp.set_defaults(func=cmd_models_sync)
 
     sp = sub.add_parser("run", help="run the server in the foreground")
     add_model_flags(sp); server_opts(sp); sp.set_defaults(func=cmd_run)
@@ -1050,6 +1123,7 @@ def print_overview() -> None:
             ("models pull", "download a model to the cache (no server)"),
             ("models rm", "delete a model from the cache to free disk"),
             ("models clean", "remove stale *.incomplete temp files"),
+            ("models sync", "register all downloaded models with pi"),
         ]),
         ("Agent & install", [
             ("setup", "install mlx-lm + pi, configure, symlink mlx-pi onto PATH"),
