@@ -61,7 +61,9 @@ You ──run──▶ ./mlx-pi pi ──HTTP /v1/chat/completions──▶ MLX 
 ./mlx-pi restart    down + up.
 ./mlx-pi status     Show running state + health.
 ./mlx-pi logs       Tail the server log.
-./mlx-pi models     List preset + downloaded models, and what pi is set to use.
+./mlx-pi models       List preset + downloaded models, and what pi is set to use.
+./mlx-pi models pull  Download a model to the cache (no server; resumes partials).
+./mlx-pi models rm    Delete a model from the cache to free disk.
 ./mlx-pi run        Run the server in the FOREGROUND (Ctrl-C to stop).
 ./mlx-pi pi         Ensure the server is up, then launch the pi agent.
 ./mlx-pi plist      Generate a launchd plist for auto-start (does NOT install it).
@@ -92,13 +94,16 @@ Examples:
 ./mlx-pi up --model mlx-community/Qwen3-4B-Instruct-2507-4bit
 ```
 
-> ⚠️ **`setup` configures; `up` downloads.** `setup --qwen-coder` only points pi at the model — it does **not** download the (multi-GB) weights. The download happens on the first `./mlx-pi up`. Two consequences:
-> - **Pass the same flag to both.** `up` does *not* inherit `setup`'s choice; run `./mlx-pi up --qwen-coder`, or it serves the default 4B and mismatches what pi calls. (Or persist it: `export MLX_MODEL=<id>`.)
-> - **Want the weights during setup?** Add `-p`/`--prefetch`: `./mlx-pi setup --qwen-coder -p`.
+> ⚠️ **`setup` configures; downloads are separate.** `setup --qwen-coder` only points pi at the model — it does **not** download the (multi-GB) weights. You have three ways to get them:
+> - **Explicitly:** `./mlx-pi models pull --qwen-coder` downloads to the cache without starting a server (and resumes interrupted downloads).
+> - **During setup:** add `-p`/`--prefetch` — `./mlx-pi setup --qwen-coder -p`.
+> - **Lazily:** the first `./mlx-pi up --qwen-coder` fetches it as the server boots.
+>
+> Either way, **pass the same model flag to `up`** — it does *not* inherit `setup`'s choice, so `./mlx-pi up --qwen-coder` (or persist it with `export MLX_MODEL=<id>`), else it serves the default 4B and mismatches what pi calls.
 
 **Before downloading anything**, the tool queries Hugging Face for the exact size, prints the download size + a rough RAM estimate, warns if it exceeds your memory, and asks you to confirm (default **No**). Add `-y`/`--yes` to skip the prompt. If the model is already cached, it proceeds silently.
 
-Run **`./mlx-pi models`** any time to see the presets, which are downloaded (with on-disk size — partial/interrupted downloads are flagged as `⏳ partial`), and which one pi is currently configured to call.
+Run **`./mlx-pi models`** any time to see the presets, which are downloaded (with on-disk size — partial/interrupted downloads are flagged as `⏳ partial`), and which one pi is currently configured to call. Use **`./mlx-pi models pull [flags]`** to download one ahead of time (resumes partials) and **`./mlx-pi models rm [flags]`** to delete one and reclaim disk.
 
 > 💡 Want the MLX format. Look for repos under `mlx-community` (or `lmstudio-community` …-MLX-…). Avoid `.gguf` files — those are for llama.cpp/Ollama, not `mlx_lm`. See guide §2 for how to read model names, quantization (`4bit`/`8bit`/`bf16`), and `A3B`/`A4B` MoE "active params".
 

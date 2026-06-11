@@ -20,7 +20,7 @@
 #    restart   down + up.
 #    status    Show running state + health.
 #    logs      Tail the server log.
-#    models    List preset + downloaded models (and what pi is set to use).
+#    models    List models; `models pull` downloads one, `models rm` deletes one.
 #    run       Run the server in the FOREGROUND (Ctrl-C to stop).
 #    pi        Ensure the server is up, then launch the pi agent.
 #    plist     Generate a personalized launchd plist (does NOT install it).
@@ -556,8 +556,8 @@ def cmd_models(args) -> None:
         active = "[bold green]▸[/]" if repo == configured else ""
         t.add_row(flag, repo, modality, _download_cell(repo), active)
     console.print(t)
-    console.print("  [dim]▸ = what pi is configured to call · "
-                  "download happens on first [cyan]mlx-pi up[/] (or [cyan]setup -p[/])[/]")
+    console.print("  [dim]▸ = what pi is configured to call · download with "
+                  "[cyan]mlx-pi models pull[/] (or it's fetched on first [cyan]up[/])[/]")
 
     # Any other cached models that aren't presets — still usable via --model.
     others = sorted(present - preset_ids)
@@ -577,11 +577,54 @@ def cmd_models(args) -> None:
     if configured and model_status(configured) == "partial":
         console.print()
         warn(f"pi's model [bold]{configured}[/] is only [yellow]partially[/] downloaded — "
-             "re-run 'mlx-pi up' to resume and finish it (watch 'mlx-pi logs').")
+             "run 'mlx-pi models pull' to resume and finish it (watch 'mlx-pi logs').")
     elif configured and model_status(configured) == "absent":
         console.print()
         warn(f"pi is configured for [bold]{configured}[/], which isn't downloaded yet — "
-             "it'll be fetched on the next 'up' (with a size prompt).")
+             "run 'mlx-pi models pull' to fetch it.")
+
+def _hf_download(repo: str) -> None:
+    """Pure download of a repo into the HF cache via huggingface_hub: no model
+    load (so no RAM needed), resumes *.incomplete blobs, streams progress. Run
+    through uv so the dependency is managed without polluting anything."""
+    info(f"Downloading [bold]{repo}[/] → {HF_CACHE}")
+    run(["uv", "run", "--with", "huggingface_hub", "python", "-c",
+         "import sys; from huggingface_hub import snapshot_download; "
+         "snapshot_download(sys.argv[1])", repo])
+
+def cmd_models_pull(args) -> None:
+    model = resolve_model(args)
+    status = model_status(model)
+    if status == "complete":
+        ok(f"Already downloaded: {model}  ({_gb(cache_size_bytes(model))})")
+        return
+    if status == "partial":
+        info(f"Resuming partial download: {model}  ({_gb(cache_size_bytes(model))} so far)")
+    elif not confirm_download(model, args.yes):  # absent → show size + confirm
+        warn("Download cancelled.")
+        return
+    _hf_download(model)
+    if model_status(model) == "complete":
+        ok(f"Downloaded: {model}  ({_gb(cache_size_bytes(model))})")
+    else:
+        warn("Download ended but the model still looks incomplete — "
+             "re-run 'mlx-pi models pull' to retry.")
+
+def cmd_models_rm(args) -> None:
+    model = resolve_model(args)
+    base = HF_CACHE / f"models--{model.replace('/', '--')}"
+    if not base.is_dir():
+        warn(f"Not in cache — nothing to remove: {model}")
+        return
+    size = cache_size_bytes(model)
+    if model == configured_model_id():
+        warn(f"Heads up: pi is currently configured to use this model ({model}).")
+    if not args.yes and not Confirm.ask(
+            f"  [yellow]❓ Delete {model} ({_gb(size)}) from the cache?[/]", default=False):
+        warn("Cancelled.")
+        return
+    shutil.rmtree(base, ignore_errors=True)
+    ok(f"Removed {model} — freed ~{_gb(size)}.")
 
 def trim_log() -> None:
     """Cap server.log: if it exceeds LOG_MAX_BYTES, keep only the most recent
@@ -836,8 +879,19 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("logs", help="tail the server log")
     sp.set_defaults(func=cmd_logs)
 
-    sp = sub.add_parser("models", help="list preset + downloaded models")
-    sp.set_defaults(func=cmd_models)
+    mp = sub.add_parser("models", help="list / download / remove models")
+    mp.set_defaults(func=cmd_models)  # bare `models` = list
+    msub = mp.add_subparsers(dest="models_cmd")
+    lp = msub.add_parser("list", help="list preset + downloaded models")
+    lp.set_defaults(func=cmd_models)
+    pp = msub.add_parser("pull", help="download a model to the cache (no server)")
+    add_model_flags(pp)
+    pp.add_argument("-y", "--yes", action="store_true", help="skip the download-size prompt")
+    pp.set_defaults(func=cmd_models_pull)
+    rp = msub.add_parser("rm", help="delete a model from the cache to free disk")
+    add_model_flags(rp)
+    rp.add_argument("-y", "--yes", action="store_true", help="skip the delete confirmation")
+    rp.set_defaults(func=cmd_models_rm)
 
     sp = sub.add_parser("run", help="run the server in the foreground")
     add_model_flags(sp); server_opts(sp); sp.set_defaults(func=cmd_run)
@@ -881,7 +935,11 @@ def print_overview() -> None:
         ("Inspect", [
             ("status", "show running state + health"),
             ("logs", "tail the server log"),
-            ("models", "list preset + downloaded models"),
+        ]),
+        ("Models", [
+            ("models", "list presets + downloaded models (and pi's choice)"),
+            ("models pull", "download a model to the cache (no server)"),
+            ("models rm", "delete a model from the cache to free disk"),
         ]),
         ("Agent & install", [
             ("setup", "install mlx-lm + pi, configure, symlink mlx-pi onto PATH"),
