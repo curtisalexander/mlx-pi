@@ -29,6 +29,11 @@
 #    uninstall Remove that symlink.
 #
 #  Try:  ./mlx-pi --help   or   ./mlx-pi <subcommand> --help
+#
+#  FILE LAYOUT (top → bottom)
+#    constants · output helpers · platform · HF cache/model-state · model
+#    resolution · pi config · server process mgmt · then one section per
+#    subcommand group, and finally argument parsing / dispatch.
 # ============================================================================
 
 from __future__ import annotations
@@ -161,7 +166,7 @@ def require_apple_silicon() -> None:
 
 
 # ============================================================================
-#  Hugging Face size lookup + download confirmation
+#  HF cache & model state — what's downloaded, how big, complete vs partial
 #  (We NEVER pull weights without telling you the size first.)
 # ============================================================================
 
@@ -182,6 +187,74 @@ def model_is_cached(repo: str) -> bool:
     d = HF_CACHE / f"models--{repo.replace('/', '--')}"
     snaps = d / "snapshots"
     return snaps.is_dir() and any(snaps.iterdir())
+
+def _active_incomplete(blobs: Path) -> bool:
+    """True if any *.incomplete temp is a genuinely in-progress download. A temp
+    is named '<sha>.<etag>.incomplete'; it's only active if its final blob
+    '<sha>' is absent. Orphaned temps from earlier attempts whose blob already
+    landed are stale leftovers and must be ignored — otherwise a fully
+    downloaded model reads as 'partial' forever (HF never cleans them up)."""
+    if not blobs.is_dir():
+        return False
+    return any(f.name.endswith(".incomplete") and not (blobs / f.name.split(".", 1)[0]).exists()
+               for f in blobs.iterdir())
+
+def model_status(repo: str) -> str:
+    """'complete', 'partial', or 'absent' for a model in the local HF cache."""
+    base = HF_CACHE / f"models--{repo.replace('/', '--')}"
+    if not base.is_dir():
+        return "absent"
+    if _active_incomplete(base / "blobs"):
+        return "partial"
+    return "complete" if model_is_cached(repo) else "partial"
+
+def prune_stale_incomplete(repo: str) -> int:
+    """Delete orphaned *.incomplete temps (final blob already present) and return
+    bytes freed. Never removes an active download (final blob still missing)."""
+    blobs = HF_CACHE / f"models--{repo.replace('/', '--')}" / "blobs"
+    if not blobs.is_dir():
+        return 0
+    freed = 0
+    for f in blobs.iterdir():
+        if f.name.endswith(".incomplete") and (blobs / f.name.split(".", 1)[0]).exists():
+            try:
+                freed += f.stat().st_size
+                f.unlink()
+            except OSError:
+                pass
+    return freed
+
+def _present_repo_ids() -> list[str]:
+    """Every MLX model with a cache dir (complete OR partial), as repo ids."""
+    if not HF_CACHE.is_dir():
+        return []
+    return [d.name[len("models--"):].replace("--", "/")
+            for d in HF_CACHE.iterdir()
+            if d.is_dir() and d.name.startswith("models--")]
+
+def cache_size_bytes(repo: str) -> int | None:
+    """On-disk size of a cached model (sum of its blob files). None if absent."""
+    blobs = HF_CACHE / f"models--{repo.replace('/', '--')}" / "blobs"
+    if not blobs.is_dir():
+        return None
+    total = 0
+    for f in blobs.iterdir():
+        if f.name.endswith(".incomplete"):  # temp files aren't part of the model
+            continue
+        try:
+            total += f.stat().st_size
+        except OSError:
+            pass
+    return total
+
+def _size(n: int | None) -> str:
+    """Human-readable byte size (GB/MB/KB), so small cleanups don't read 0.0 GB."""
+    if not n:
+        return "—"
+    for unit, scale in (("GB", 1024 ** 3), ("MB", 1024 ** 2), ("KB", 1024)):
+        if n >= scale:
+            return f"{n / scale:.1f} {unit}"
+    return f"{n} B"
 
 def confirm_download(repo: str, assume_yes: bool) -> bool:
     """Show download size + RAM estimate and ask to proceed. True = go ahead."""
@@ -242,137 +315,8 @@ def add_model_flags(p: argparse.ArgumentParser) -> None:
 
 
 # ============================================================================
-#  Server process management (PID file + health checks)
+#  pi configuration (registering local-mlx models in ~/.pi/agent/models.json)
 # ============================================================================
-
-def server_pid() -> int | None:
-    if not PID_FILE.exists():
-        return None
-    try:
-        pid = int(PID_FILE.read_text().strip())
-    except Exception:
-        return None
-    # os.kill(pid, 0) raises if the process is gone.
-    try:
-        os.kill(pid, 0)
-        return pid
-    except OSError:
-        return None
-
-def is_healthy(host: str, port: int) -> bool:
-    try:
-        r = httpx.get(f"http://{host}:{port}/v1/models", timeout=2)
-        return r.status_code == 200
-    except Exception:
-        return False
-
-def served_model(pid: int) -> str | None:
-    """The model the running server was launched with, read from its argv. The
-    /v1/models endpoint lists every cached model (mlx_lm can hot-swap per
-    request), so it can't tell us the loaded one — the process args can."""
-    try:
-        # -ww: don't truncate the command line to terminal width.
-        out = subprocess.check_output(["ps", "-ww", "-p", str(pid), "-o", "command="], text=True)
-    except Exception:
-        return None
-    parts = out.split()
-    if "--model" in parts:
-        i = parts.index("--model")
-        if i + 1 < len(parts):
-            return parts[i + 1]
-    return None
-
-def _model_requested(args) -> bool:
-    """True if the user explicitly chose a model (flag or MLX_MODEL), vs the
-    implicit default — so we only warn about a mismatch when they actually asked."""
-    return bool(getattr(args, "qwen_coder", False) or getattr(args, "gemma", False)
-                or getattr(args, "model", None) or os.environ.get("MLX_MODEL"))
-
-def server_bin() -> str:
-    """Absolute path to mlx_lm.server (uv installs it to ~/.local/bin)."""
-    return have("mlx_lm.server") or str(Path.home() / ".local" / "bin" / "mlx_lm.server")
-
-def require_mlx() -> None:
-    if not have("mlx_lm.server"):
-        err("mlx_lm.server not found. Run './mlx-pi setup' first (then open a new terminal).")
-        sys.exit(1)
-
-
-# ============================================================================
-#  SUBCOMMAND: setup
-# ============================================================================
-
-def cmd_setup(args) -> None:
-    model = resolve_model(args)
-    port = args.port
-    base_url = f"http://localhost:{port}/v1"
-
-    console.print("\n[bold cyan]🍎 mlx-pi setup — MLX + pi for Apple Silicon[/]")
-    info(f"Model:    [bold]{model}[/]")
-    info(f"pi URL:   [bold]{base_url}[/]")
-
-    # --- 1. Platform -------------------------------------------------------
-    step("Step 1/6 · Checking your machine")
-    require_apple_silicon()
-    chip = sysctl("machdep.cpu.brand_string") or "Apple Silicon"
-    ok(f"Running on [bold]{chip}[/] with [bold]{ram_gb()} GB[/] unified memory")
-
-    # --- 2. mlx-lm (global uv tool) ---------------------------------------
-    step("Step 2/6 · Installing mlx-lm globally (uv tool)")
-    if not have("uv"):
-        err("uv not found. Run ./bootstrap.sh first.")
-        sys.exit(1)
-    # `uv tool install` = isolated env, but CLIs exposed globally on PATH.
-    # --upgrade makes this idempotent (installs or updates a single global copy).
-    run(["uv", "tool", "install", "--upgrade", "mlx-lm"])
-    if have("mlx_lm.server"):
-        ok("mlx-lm ready — mlx_lm.server / generate / chat are on PATH")
-    else:
-        warn("mlx-lm installed but not yet on PATH — open a new terminal (or run 'uv tool update-shell').")
-
-    # --- 3. Node + pi -----------------------------------------------------
-    step("Step 3/6 · Installing Node.js + pi harness")
-    if not have("node"):
-        if have("brew"):
-            run(["brew", "install", "node"])
-        else:
-            err("Node.js required for pi, and Homebrew isn't installed.")
-            console.print("     Fix: install Node from https://nodejs.org (LTS), then re-run.")
-            sys.exit(1)
-    else:
-        ok(f"Node present ({subprocess.check_output(['node', '--version'], text=True).strip()})")
-    # --ignore-scripts is the latest recommended install: pi needs no lifecycle
-    # scripts, so skipping them is faster and avoids running arbitrary scripts.
-    run(["npm", "install", "-g", "--ignore-scripts", PI_NPM_PKG])
-    ok("pi installed") if have("pi") else warn("pi not on PATH — check `npm root -g`.")
-
-    # --- 4. Configure pi --> local server ---------------------------------
-    step("Step 4/6 · Pointing pi at the local MLX server")
-    configure_pi(model, base_url)
-
-    # --- 5. Optional prefetch (with size confirmation) --------------------
-    step("Step 5/6 · Model download")
-    if args.prefetch:
-        if confirm_download(model, args.yes):
-            info(f"Downloading & warming {model} …")
-            run([server_bin().replace("mlx_lm.server", "mlx_lm.generate"),
-                 "--model", model, "--prompt", "Say ok.", "--max-tokens", "1"])
-            ok("Model downloaded and verified.")
-        else:
-            warn("Download skipped — the server will fetch it on first 'up'.")
-    else:
-        info("Skipping download. './mlx-pi up' will fetch it (with a size check) on first use.")
-
-    # --- 6. Global command (PATH symlink) ---------------------------------
-    step("Step 6/6 · Making 'mlx-pi' a global command")
-    linked = False
-    if args.no_link:
-        info("Skipping PATH symlink (--no-link). Run 'mlx-pi install' later if you want it.")
-    else:
-        link_dir = Path.home() / ".local" / "bin"
-        linked = install_symlink(link_dir) and _on_path(link_dir)
-
-    _print_setup_summary(model, linked=linked)
 
 def _pi_multimodal(repo: str) -> bool:
     """Best-effort: which models accept image input (so pi advertises it)."""
@@ -455,6 +399,183 @@ def refresh_pi_models(primary: str | None = None, force_primary: bool = False) -
     PI_CONFIG_FILE.write_text(json.dumps(data, indent=2))
     return len(ids)
 
+def configured_model_id() -> str | None:
+    """pi's default model (first in its list), if any."""
+    ids = configured_model_ids()
+    return ids[0] if ids else None
+
+def configured_model_ids() -> list[str]:
+    """Every model id registered with pi's local-mlx provider (default first)."""
+    try:
+        data = json.loads(PI_CONFIG_FILE.read_text())
+        return [m["id"] for m in data["providers"][PI_PROVIDER_ID]["models"]]
+    except Exception:
+        return []
+
+
+# ============================================================================
+#  Server process management (PID file + health checks + log helpers)
+# ============================================================================
+
+def server_pid() -> int | None:
+    if not PID_FILE.exists():
+        return None
+    try:
+        pid = int(PID_FILE.read_text().strip())
+    except Exception:
+        return None
+    # os.kill(pid, 0) raises if the process is gone.
+    try:
+        os.kill(pid, 0)
+        return pid
+    except OSError:
+        return None
+
+def is_healthy(host: str, port: int) -> bool:
+    try:
+        r = httpx.get(f"http://{host}:{port}/v1/models", timeout=2)
+        return r.status_code == 200
+    except Exception:
+        return False
+
+def served_model(pid: int) -> str | None:
+    """The model the running server was launched with, read from its argv. The
+    /v1/models endpoint lists every cached model (mlx_lm can hot-swap per
+    request), so it can't tell us the loaded one — the process args can."""
+    try:
+        # -ww: don't truncate the command line to terminal width.
+        out = subprocess.check_output(["ps", "-ww", "-p", str(pid), "-o", "command="], text=True)
+    except Exception:
+        return None
+    parts = out.split()
+    if "--model" in parts:
+        i = parts.index("--model")
+        if i + 1 < len(parts):
+            return parts[i + 1]
+    return None
+
+def _model_requested(args) -> bool:
+    """True if the user explicitly chose a model (flag or MLX_MODEL), vs the
+    implicit default — so we only warn about a mismatch when they actually asked."""
+    return bool(getattr(args, "qwen_coder", False) or getattr(args, "gemma", False)
+                or getattr(args, "model", None) or os.environ.get("MLX_MODEL"))
+
+def server_bin() -> str:
+    """Absolute path to mlx_lm.server (uv installs it to ~/.local/bin)."""
+    return have("mlx_lm.server") or str(Path.home() / ".local" / "bin" / "mlx_lm.server")
+
+def require_mlx() -> None:
+    if not have("mlx_lm.server"):
+        err("mlx_lm.server not found. Run './mlx-pi setup' first (then open a new terminal).")
+        sys.exit(1)
+
+def trim_log() -> None:
+    """Cap server.log: if it exceeds LOG_MAX_BYTES, keep only the most recent
+    half (snapped to a line boundary) and drop the older head. Best-effort —
+    any error here must never block starting the server."""
+    try:
+        if not LOG_FILE.exists() or LOG_FILE.stat().st_size <= LOG_MAX_BYTES:
+            return
+        keep = LOG_MAX_BYTES // 2
+        with open(LOG_FILE, "rb") as f:
+            f.seek(-keep, os.SEEK_END)
+            tail = f.read()
+        # Drop the partial first line so the kept log starts cleanly.
+        nl = tail.find(b"\n")
+        if nl != -1:
+            tail = tail[nl + 1:]
+        with open(LOG_FILE, "wb") as f:
+            f.write(b"--- log trimmed (exceeded %d bytes) ---\n" % LOG_MAX_BYTES)
+            f.write(tail)
+    except OSError:
+        pass
+
+def _tail(path: Path, n: int) -> None:
+    """Print the last n lines of a file (best-effort, for error context)."""
+    try:
+        lines = path.read_text(errors="replace").splitlines()
+    except OSError:
+        return
+    for line in lines[-n:]:
+        console.print(f"  [dim]{line}[/]")
+
+
+# ============================================================================
+#  SUBCOMMAND: setup
+# ============================================================================
+
+def cmd_setup(args) -> None:
+    model = resolve_model(args)
+    port = args.port
+    base_url = f"http://localhost:{port}/v1"
+
+    console.print("\n[bold cyan]🍎 mlx-pi setup — MLX + pi for Apple Silicon[/]")
+    info(f"Model:    [bold]{model}[/]")
+    info(f"pi URL:   [bold]{base_url}[/]")
+
+    # --- 1. Platform -------------------------------------------------------
+    step("Step 1/6 · Checking your machine")
+    require_apple_silicon()
+    chip = sysctl("machdep.cpu.brand_string") or "Apple Silicon"
+    ok(f"Running on [bold]{chip}[/] with [bold]{ram_gb()} GB[/] unified memory")
+
+    # --- 2. mlx-lm (global uv tool) ---------------------------------------
+    step("Step 2/6 · Installing mlx-lm globally (uv tool)")
+    if not have("uv"):
+        err("uv not found. Run ./bootstrap.sh first.")
+        sys.exit(1)
+    # `uv tool install` = isolated env, but CLIs exposed globally on PATH.
+    # --upgrade makes this idempotent (installs or updates a single global copy).
+    run(["uv", "tool", "install", "--upgrade", "mlx-lm"])
+    if have("mlx_lm.server"):
+        ok("mlx-lm ready — mlx_lm.server / generate / chat are on PATH")
+    else:
+        warn("mlx-lm installed but not yet on PATH — open a new terminal (or run 'uv tool update-shell').")
+
+    # --- 3. Node + pi -----------------------------------------------------
+    step("Step 3/6 · Installing Node.js + pi harness")
+    if not have("node"):
+        if have("brew"):
+            run(["brew", "install", "node"])
+        else:
+            err("Node.js required for pi, and Homebrew isn't installed.")
+            console.print("     Fix: install Node from https://nodejs.org (LTS), then re-run.")
+            sys.exit(1)
+    else:
+        ok(f"Node present ({subprocess.check_output(['node', '--version'], text=True).strip()})")
+    # --ignore-scripts is the latest recommended install: pi needs no lifecycle
+    # scripts, so skipping them is faster and avoids running arbitrary scripts.
+    run(["npm", "install", "-g", "--ignore-scripts", PI_NPM_PKG])
+    ok("pi installed") if have("pi") else warn("pi not on PATH — check `npm root -g`.")
+
+    # --- 4. Configure pi --> local server ---------------------------------
+    step("Step 4/6 · Pointing pi at the local MLX server")
+    configure_pi(model, base_url)
+
+    # --- 5. Optional prefetch (with size confirmation) --------------------
+    step("Step 5/6 · Model download")
+    if args.prefetch:
+        if confirm_download(model, args.yes):
+            info(f"Downloading & warming {model} …")
+            run([server_bin().replace("mlx_lm.server", "mlx_lm.generate"),
+                 "--model", model, "--prompt", "Say ok.", "--max-tokens", "1"])
+            ok("Model downloaded and verified.")
+        else:
+            warn("Download skipped — the server will fetch it on first 'up'.")
+    else:
+        info("Skipping download. './mlx-pi up' will fetch it (with a size check) on first use.")
+
+    # --- 6. Global command (PATH symlink) ---------------------------------
+    step("Step 6/6 · Making 'mlx-pi' a global command")
+    linked = False
+    if args.no_link:
+        info("Skipping PATH symlink (--no-link). Run 'mlx-pi install' later if you want it.")
+    else:
+        link_dir = Path.home() / ".local" / "bin"
+        linked = install_symlink(link_dir) and _on_path(link_dir)
+
+    _print_setup_summary(model, linked=linked)
+
 def _print_setup_summary(model: str, linked: bool = True) -> None:
     p = "mlx-pi" if linked else "./mlx-pi"
     console.print()
@@ -480,8 +601,7 @@ def _print_setup_summary(model: str, linked: bool = True) -> None:
 
 
 # ============================================================================
-#  SUBCOMMANDS: server lifecycle — up / down / restart / status
-#  (logs / run / pi live further down, after the models helpers)
+#  SUBCOMMANDS: server lifecycle — up / down / restart / status / logs / run / pi
 # ============================================================================
 
 def cmd_up(args) -> bool:
@@ -595,90 +715,44 @@ def cmd_status(args) -> None:
         info("Process is up but not answering yet — likely still loading/downloading "
              "the model (watch './mlx-pi logs').")
 
+def cmd_logs(args) -> None:
+    if not LOG_FILE.exists():
+        warn(f"No log yet at {LOG_FILE}")
+        return
+    info(f"Tailing {LOG_FILE} (Ctrl-C to stop; server keeps running)…")
+    # Hand off to `tail -f` for a proper follow.
+    os.execvp("tail", ["tail", "-n", "50", "-f", str(LOG_FILE)])
+
+def cmd_run(args) -> None:
+    """Foreground server (blocks). Good for debugging."""
+    require_mlx()
+    model = resolve_model(args)
+    if not confirm_download(model, args.yes):
+        warn("Not starting server.")
+        return
+    info(f"Running MLX server in the FOREGROUND (Ctrl-C to stop): {model}")
+    os.execvp(server_bin(), [server_bin(), "--model", model,
+              "--host", args.host, "--port", str(args.port),
+              "--max-tokens", str(DEFAULT_MAX_TOKENS)])
+
+def cmd_pi(args) -> None:
+    if not have("pi"):
+        err("pi not found. Run './mlx-pi setup' first.")
+        sys.exit(1)
+    # Ordering guarantee: bring the engine up (idempotent) BEFORE pi starts.
+    if not cmd_up(args):
+        return
+    console.print()
+    info("Launching pi. Inside pi: [bold]/model[/] → switch between your "
+         "[bold]local-mlx[/] models.")
+    info("Leaving pi (/exit) keeps the server running.")
+    console.print()
+    os.execvp("pi", ["pi"])
+
+
 # ============================================================================
-#  HF cache & model-state helpers (shared by `models` and pi config)
+#  SUBCOMMAND: models — list / pull / rm / clean / sync / doctor
 # ============================================================================
-
-def cache_size_bytes(repo: str) -> int | None:
-    """On-disk size of a cached model (sum of its blob files). None if absent."""
-    blobs = HF_CACHE / f"models--{repo.replace('/', '--')}" / "blobs"
-    if not blobs.is_dir():
-        return None
-    total = 0
-    for f in blobs.iterdir():
-        if f.name.endswith(".incomplete"):  # temp files aren't part of the model
-            continue
-        try:
-            total += f.stat().st_size
-        except OSError:
-            pass
-    return total
-
-def configured_model_id() -> str | None:
-    """pi's default model (first in its list), if any."""
-    ids = configured_model_ids()
-    return ids[0] if ids else None
-
-def configured_model_ids() -> list[str]:
-    """Every model id registered with pi's local-mlx provider (default first)."""
-    try:
-        data = json.loads(PI_CONFIG_FILE.read_text())
-        return [m["id"] for m in data["providers"][PI_PROVIDER_ID]["models"]]
-    except Exception:
-        return []
-
-def _active_incomplete(blobs: Path) -> bool:
-    """True if any *.incomplete temp is a genuinely in-progress download. A temp
-    is named '<sha>.<etag>.incomplete'; it's only active if its final blob
-    '<sha>' is absent. Orphaned temps from earlier attempts whose blob already
-    landed are stale leftovers and must be ignored — otherwise a fully
-    downloaded model reads as 'partial' forever (HF never cleans them up)."""
-    if not blobs.is_dir():
-        return False
-    return any(f.name.endswith(".incomplete") and not (blobs / f.name.split(".", 1)[0]).exists()
-               for f in blobs.iterdir())
-
-def model_status(repo: str) -> str:
-    """'complete', 'partial', or 'absent' for a model in the local HF cache."""
-    base = HF_CACHE / f"models--{repo.replace('/', '--')}"
-    if not base.is_dir():
-        return "absent"
-    if _active_incomplete(base / "blobs"):
-        return "partial"
-    return "complete" if model_is_cached(repo) else "partial"
-
-def prune_stale_incomplete(repo: str) -> int:
-    """Delete orphaned *.incomplete temps (final blob already present) and return
-    bytes freed. Never removes an active download (final blob still missing)."""
-    blobs = HF_CACHE / f"models--{repo.replace('/', '--')}" / "blobs"
-    if not blobs.is_dir():
-        return 0
-    freed = 0
-    for f in blobs.iterdir():
-        if f.name.endswith(".incomplete") and (blobs / f.name.split(".", 1)[0]).exists():
-            try:
-                freed += f.stat().st_size
-                f.unlink()
-            except OSError:
-                pass
-    return freed
-
-def _present_repo_ids() -> list[str]:
-    """Every MLX model with a cache dir (complete OR partial), as repo ids."""
-    if not HF_CACHE.is_dir():
-        return []
-    return [d.name[len("models--"):].replace("--", "/")
-            for d in HF_CACHE.iterdir()
-            if d.is_dir() and d.name.startswith("models--")]
-
-def _size(n: int | None) -> str:
-    """Human-readable byte size (GB/MB/KB), so small cleanups don't read 0.0 GB."""
-    if not n:
-        return "—"
-    for unit, scale in (("GB", 1024 ** 3), ("MB", 1024 ** 2), ("KB", 1024)):
-        if n >= scale:
-            return f"{n / scale:.1f} {unit}"
-    return f"{n} B"
 
 def _download_cell(repo: str) -> str:
     """Rendered 'Downloaded' column for a repo, by cache status."""
@@ -688,10 +762,6 @@ def _download_cell(repo: str) -> str:
     if s == "partial":
         return f"[yellow]⏳ partial ({_size(cache_size_bytes(repo))} so far)[/]"
     return "[dim]— not yet[/]"
-
-# ============================================================================
-#  SUBCOMMAND: models — list / pull / rm / clean / sync / doctor
-# ============================================================================
 
 def cmd_models(args) -> None:
     configured = configured_model_id()
@@ -837,74 +907,6 @@ def cmd_models_doctor(args) -> None:
     cmd_models_clean(args)
     step("2/2 · Aligning pi's model list with the cache")
     cmd_models_sync(args)
-
-# ============================================================================
-#  SUBCOMMANDS: logs / run / pi  (+ log-file helpers)
-# ============================================================================
-
-def trim_log() -> None:
-    """Cap server.log: if it exceeds LOG_MAX_BYTES, keep only the most recent
-    half (snapped to a line boundary) and drop the older head. Best-effort —
-    any error here must never block starting the server."""
-    try:
-        if not LOG_FILE.exists() or LOG_FILE.stat().st_size <= LOG_MAX_BYTES:
-            return
-        keep = LOG_MAX_BYTES // 2
-        with open(LOG_FILE, "rb") as f:
-            f.seek(-keep, os.SEEK_END)
-            tail = f.read()
-        # Drop the partial first line so the kept log starts cleanly.
-        nl = tail.find(b"\n")
-        if nl != -1:
-            tail = tail[nl + 1:]
-        with open(LOG_FILE, "wb") as f:
-            f.write(b"--- log trimmed (exceeded %d bytes) ---\n" % LOG_MAX_BYTES)
-            f.write(tail)
-    except OSError:
-        pass
-
-def _tail(path: Path, n: int) -> None:
-    """Print the last n lines of a file (best-effort, for error context)."""
-    try:
-        lines = path.read_text(errors="replace").splitlines()
-    except OSError:
-        return
-    for line in lines[-n:]:
-        console.print(f"  [dim]{line}[/]")
-
-def cmd_logs(args) -> None:
-    if not LOG_FILE.exists():
-        warn(f"No log yet at {LOG_FILE}")
-        return
-    info(f"Tailing {LOG_FILE} (Ctrl-C to stop; server keeps running)…")
-    # Hand off to `tail -f` for a proper follow.
-    os.execvp("tail", ["tail", "-n", "50", "-f", str(LOG_FILE)])
-
-def cmd_run(args) -> None:
-    """Foreground server (blocks). Good for debugging."""
-    require_mlx()
-    model = resolve_model(args)
-    if not confirm_download(model, args.yes):
-        warn("Not starting server.")
-        return
-    info(f"Running MLX server in the FOREGROUND (Ctrl-C to stop): {model}")
-    os.execvp(server_bin(), [server_bin(), "--model", model,
-              "--host", args.host, "--port", str(args.port),
-              "--max-tokens", str(DEFAULT_MAX_TOKENS)])
-
-def cmd_pi(args) -> None:
-    if not have("pi"):
-        err("pi not found. Run './mlx-pi setup' first.")
-        sys.exit(1)
-    # Ordering guarantee: bring the engine up (idempotent) BEFORE pi starts.
-    if not cmd_up(args):
-        return
-    console.print()
-    info("Launching pi. Inside pi: [bold]/model[/] → switch between your "
-         "[bold]local-mlx[/] models.")
-    info("Leaving pi (/exit) keeps the server running.")
-    console.print()
-    os.execvp("pi", ["pi"])
 
 
 # ============================================================================
