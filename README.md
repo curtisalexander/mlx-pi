@@ -21,7 +21,7 @@ When you're done:
 ./mlx-pi down         # stop the server, free your RAM
 ```
 
-> 💡 Tired of the `./` prefix? Run `./mlx-pi install` to symlink it into `~/.local/bin`, then call `mlx-pi` from any directory. It points back at this repo, so `git pull` updates the global command automatically. Undo with `mlx-pi uninstall`. (It's a single-file `uv` script, so this symlink — not `uv tool install`, which needs a packaged project — is the right way to install it globally.)
+> 💡 `setup` symlinks `mlx-pi` into `~/.local/bin` by default, so after step 2 you can drop the `./` and just run `mlx-pi` from any directory. The symlink points back at this repo, so `git pull` updates the global command automatically. Pass `setup --no-link` to skip it, run `mlx-pi install` to add it later, or `mlx-pi uninstall` to remove it. (It's a single-file `uv` script, so this symlink — not `uv tool install`, which needs a packaged project — is the right way to install it globally.)
 
 The default model is a small **Qwen3 4B** (~2 GB) so you can confirm the whole pipeline works in a couple of minutes before committing to anything bigger.
 
@@ -55,7 +55,7 @@ You ──run──▶ ./mlx-pi pi ──HTTP /v1/chat/completions──▶ MLX 
 ## Commands
 
 ```text
-./mlx-pi setup      Install mlx-lm + pi, and point pi at the local server.
+./mlx-pi setup      Install mlx-lm + pi, point pi at the local server, and symlink mlx-pi onto your PATH (--no-link to skip).
 ./mlx-pi up         Start the MLX server in the background; wait until healthy.
 ./mlx-pi down       Stop the background server.
 ./mlx-pi restart    down + up.

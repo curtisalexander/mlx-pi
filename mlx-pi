@@ -263,13 +263,13 @@ def cmd_setup(args) -> None:
     info(f"pi URL:   [bold]{base_url}[/]")
 
     # --- 1. Platform -------------------------------------------------------
-    step("Step 1/5 · Checking your machine")
+    step("Step 1/6 · Checking your machine")
     require_apple_silicon()
     chip = sysctl("machdep.cpu.brand_string") or "Apple Silicon"
     ok(f"Running on [bold]{chip}[/] with [bold]{ram_gb()} GB[/] unified memory")
 
     # --- 2. mlx-lm (global uv tool) ---------------------------------------
-    step("Step 2/5 · Installing mlx-lm globally (uv tool)")
+    step("Step 2/6 · Installing mlx-lm globally (uv tool)")
     if not have("uv"):
         err("uv not found. Run ./bootstrap.sh first.")
         sys.exit(1)
@@ -282,7 +282,7 @@ def cmd_setup(args) -> None:
         warn("mlx-lm installed but not yet on PATH — open a new terminal (or run 'uv tool update-shell').")
 
     # --- 3. Node + pi -----------------------------------------------------
-    step("Step 3/5 · Installing Node.js + pi harness")
+    step("Step 3/6 · Installing Node.js + pi harness")
     if not have("node"):
         if have("brew"):
             run(["brew", "install", "node"])
@@ -298,11 +298,11 @@ def cmd_setup(args) -> None:
     ok("pi installed") if have("pi") else warn("pi not on PATH — check `npm root -g`.")
 
     # --- 4. Configure pi --> local server ---------------------------------
-    step("Step 4/5 · Pointing pi at the local MLX server")
+    step("Step 4/6 · Pointing pi at the local MLX server")
     configure_pi(model, base_url)
 
     # --- 5. Optional prefetch (with size confirmation) --------------------
-    step("Step 5/5 · Model download")
+    step("Step 5/6 · Model download")
     if args.prefetch:
         if confirm_download(model, args.yes):
             info(f"Downloading & warming {model} …")
@@ -314,7 +314,16 @@ def cmd_setup(args) -> None:
     else:
         info("Skipping download. './mlx-pi up' will fetch it (with a size check) on first use.")
 
-    _print_setup_summary(model)
+    # --- 6. Global command (PATH symlink) ---------------------------------
+    step("Step 6/6 · Making 'mlx-pi' a global command")
+    linked = False
+    if args.no_link:
+        info("Skipping PATH symlink (--no-link). Run 'mlx-pi install' later if you want it.")
+    else:
+        link_dir = Path.home() / ".local" / "bin"
+        linked = install_symlink(link_dir) and _on_path(link_dir)
+
+    _print_setup_summary(model, linked=linked)
 
 def configure_pi(model: str, base_url: str) -> None:
     """Write/merge the local-mlx provider into pi's models.json (native JSON — no heredocs!)."""
@@ -349,14 +358,15 @@ def configure_pi(model: str, base_url: str) -> None:
     PI_CONFIG_FILE.write_text(json.dumps(data, indent=2))
     ok(f"Configured provider '{PI_PROVIDER_ID}' → {base_url}")
 
-def _print_setup_summary(model: str) -> None:
+def _print_setup_summary(model: str, linked: bool = True) -> None:
+    p = "mlx-pi" if linked else "./mlx-pi"
     console.print()
     console.print(Panel("[bold green]✅  SETUP COMPLETE[/]",
                         expand=False, padding=(0, 4), border_style="green"))
     console.print("\n[bold]Next steps:[/]")
-    console.print("  1️⃣  [cyan]./mlx-pi up[/]      start the MLX server (background)")
-    console.print("  2️⃣  [cyan]./mlx-pi pi[/]      launch the coding agent")
-    console.print("  3️⃣  [cyan]./mlx-pi down[/]    stop & free memory")
+    console.print(f"  1️⃣  [cyan]{p} up[/]      start the MLX server (background)")
+    console.print(f"  2️⃣  [cyan]{p} pi[/]      launch the coding agent")
+    console.print(f"  3️⃣  [cyan]{p} down[/]    stop & free memory")
     r = ram_gb()
     console.print(f"\n[bold]Memory note[/] (you have {r} GB):")
     if r >= 64:
@@ -606,26 +616,26 @@ def _on_path(d: Path) -> bool:
     entries = os.environ.get("PATH", "").split(os.pathsep)
     return str(d) in entries
 
-def cmd_install(args) -> None:
+def install_symlink(dest_dir: Path, force: bool = False) -> bool:
+    """Symlink this script as `mlx-pi` into dest_dir. Returns True if the link
+    is in place afterward. Shared by the `install` subcommand and `setup`."""
     src = Path(__file__).resolve()
-    dest_dir = Path(args.dir).expanduser()
     link = dest_dir / "mlx-pi"
-
     dest_dir.mkdir(parents=True, exist_ok=True)
 
     if link.is_symlink():
         if link.resolve() == src:
             ok(f"Already installed: {link} → {src}")
-        elif args.force:
+        elif force:
             link.unlink(); link.symlink_to(src)
             ok(f"Re-pointed {link} → {src}")
         else:
             err(f"{link} already links to {link.resolve()}. Use --force to repoint.")
-            return
+            return False
     elif link.exists():
         err(f"{link} exists and is not a symlink — refusing to overwrite. "
             "Move it aside or pass a different --dir.")
-        return
+        return False
     else:
         link.symlink_to(src)
         ok(f"Installed: {link} → {src}")
@@ -638,6 +648,10 @@ def cmd_install(args) -> None:
                       "[dim](fish)[/]")
         console.print(f"  [cyan]export PATH=\"{dest_dir}:$PATH\"[/]   "
                       "[dim](bash/zsh — add to your rc file)[/]")
+    return True
+
+def cmd_install(args) -> None:
+    install_symlink(Path(args.dir).expanduser(), force=args.force)
 
 def cmd_uninstall(args) -> None:
     link = Path(args.dir).expanduser() / "mlx-pi"
@@ -671,6 +685,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("setup", help="install mlx-lm + pi and configure everything")
     add_model_flags(sp); server_opts(sp)
     sp.add_argument("-p", "--prefetch", action="store_true", help="download the model now (with size check)")
+    sp.add_argument("--no-link", action="store_true", help="don't symlink mlx-pi onto your PATH")
     sp.set_defaults(func=cmd_setup)
 
     sp = sub.add_parser("up", help="start the MLX server in the background")
