@@ -72,8 +72,9 @@ STATE_DIR = Path(os.environ.get("MLX_STATE_DIR", Path.home() / ".mlx-pi"))
 PID_FILE = STATE_DIR / "server.pid"
 LOG_FILE = STATE_DIR / "server.log"
 # The log is appended to across every `up`, so cap its size. When it exceeds
-# this, we keep the most recent half and drop the older head.
-LOG_MAX_BYTES = 10 * 1024 * 1024  # 10 MB
+# this, we keep the most recent half and drop the older head. Override the cap
+# (in bytes) with MLX_LOG_MAX_BYTES.
+LOG_MAX_BYTES = int(os.environ.get("MLX_LOG_MAX_BYTES", 10 * 1024 * 1024))  # 10 MB
 
 # npm package for the pi coding agent (latest recommended install).
 PI_NPM_PKG = "@earendil-works/pi-coding-agent"
