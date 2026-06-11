@@ -173,7 +173,7 @@
   <h2><span class="num">2</span>Choosing a model on Hugging Face</h2>
   <p class="lead">Almost every model you’ll run lives on <a href="https://huggingface.co/mlx-community" style="color:var(--accent)">huggingface.co</a>. The skill is reading a model’s name and card well enough to answer three questions: <b>Is it MLX-ready? Will it fit in my RAM? Is it the right kind of model?</b></p>
 
-  <div class="note">💡 Run <code class="inline">mlx-pi models</code> any time to see the built-in presets, which are already downloaded (with on-disk size), and which one pi is currently configured to call.</div>
+  <div class="note">💡 Run <code class="inline">mlx-pi models</code> any time to see the built-in presets, which are already downloaded (with on-disk size — a partial or interrupted download is flagged <code class="inline">⏳ partial</code>, resumable with <code class="inline">mlx-pi up</code>), and which one pi is currently configured to call.</div>
 
   <h3>2.1 — You want the <em>MLX format</em></h3>
   <p>A raw model on Hugging Face can be in several formats. For Apple Silicon you want one already converted to <b>MLX</b> — not GGUF (that’s for llama.cpp/Ollama) and not raw PyTorch <code class="inline">safetensors</code> (unconverted).</p>

@@ -508,25 +508,41 @@ def configured_model_id() -> str | None:
     except Exception:
         return None
 
-def _cached_repo_ids() -> list[str]:
-    """MLX models fully present in the local HF cache (populated snapshot), as
-    repo ids. Mirrors model_is_cached so partial downloads aren't counted."""
+def model_status(repo: str) -> str:
+    """'complete', 'partial', or 'absent' for a model in the local HF cache.
+    A download in progress / interrupted leaves *.incomplete blobs behind, so
+    their presence (or a missing snapshot despite a cache dir) means partial."""
+    base = HF_CACHE / f"models--{repo.replace('/', '--')}"
+    if not base.is_dir():
+        return "absent"
+    blobs = base / "blobs"
+    if blobs.is_dir() and any(f.name.endswith(".incomplete") for f in blobs.iterdir()):
+        return "partial"
+    return "complete" if model_is_cached(repo) else "partial"
+
+def _present_repo_ids() -> list[str]:
+    """Every MLX model with a cache dir (complete OR partial), as repo ids."""
     if not HF_CACHE.is_dir():
         return []
-    out = []
-    for d in HF_CACHE.iterdir():
-        if d.is_dir() and d.name.startswith("models--"):
-            repo = d.name[len("models--"):].replace("--", "/")
-            if model_is_cached(repo):
-                out.append(repo)
-    return out
+    return [d.name[len("models--"):].replace("--", "/")
+            for d in HF_CACHE.iterdir()
+            if d.is_dir() and d.name.startswith("models--")]
 
 def _gb(n: int | None) -> str:
     return f"{n / 1024 ** 3:.1f} GB" if n else "—"
 
+def _download_cell(repo: str) -> str:
+    """Rendered 'Downloaded' column for a repo, by cache status."""
+    s = model_status(repo)
+    if s == "complete":
+        return f"[green]✅ {_gb(cache_size_bytes(repo))}[/]"
+    if s == "partial":
+        return f"[yellow]⏳ partial ({_gb(cache_size_bytes(repo))} so far)[/]"
+    return "[dim]— not yet[/]"
+
 def cmd_models(args) -> None:
     configured = configured_model_id()
-    cached = set(_cached_repo_ids())
+    present = set(_present_repo_ids())
     preset_ids = {repo for _, repo, _ in PRESETS}
 
     t = Table(title="Presets", title_justify="left", title_style="bold",
@@ -537,16 +553,14 @@ def cmd_models(args) -> None:
     t.add_column("Downloaded")
     t.add_column("pi", justify="center")
     for flag, repo, modality in PRESETS:
-        on_disk = repo in cached
-        dl = f"[green]✅ {_gb(cache_size_bytes(repo))}[/]" if on_disk else "[dim]— not yet[/]"
         active = "[bold green]▸[/]" if repo == configured else ""
-        t.add_row(flag, repo, modality, dl, active)
+        t.add_row(flag, repo, modality, _download_cell(repo), active)
     console.print(t)
     console.print("  [dim]▸ = what pi is configured to call · "
                   "download happens on first [cyan]mlx-pi up[/] (or [cyan]setup -p[/])[/]")
 
-    # Any other cached MLX models that aren't presets — still usable via --model.
-    others = sorted(cached - preset_ids)
+    # Any other cached models that aren't presets — still usable via --model.
+    others = sorted(present - preset_ids)
     if others:
         console.print()
         o = Table(title="Other downloaded models", title_justify="left",
@@ -555,12 +569,16 @@ def cmd_models(args) -> None:
         o.add_column("Downloaded")
         o.add_column("pi", justify="center")
         for repo in others:
-            o.add_row(repo, f"[green]✅ {_gb(cache_size_bytes(repo))}[/]",
+            o.add_row(repo, _download_cell(repo),
                       "[bold green]▸[/]" if repo == configured else "")
         console.print(o)
         console.print("  [dim]Use any of these with [cyan]mlx-pi up --model <id>[/].[/]")
 
-    if configured and configured not in cached:
+    if configured and model_status(configured) == "partial":
+        console.print()
+        warn(f"pi's model [bold]{configured}[/] is only [yellow]partially[/] downloaded — "
+             "re-run 'mlx-pi up' to resume and finish it (watch 'mlx-pi logs').")
+    elif configured and model_status(configured) == "absent":
         console.print()
         warn(f"pi is configured for [bold]{configured}[/], which isn't downloaded yet — "
              "it'll be fetched on the next 'up' (with a size prompt).")
