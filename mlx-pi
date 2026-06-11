@@ -217,7 +217,9 @@ def resolve_model(args) -> str:
 
 def add_model_flags(p: argparse.ArgumentParser) -> None:
     """Attach the common model-selection flags to a subparser."""
-    p.add_argument("-m", "--model", help="Hugging Face MLX model id to use")
+    p.add_argument("-m", "--model", metavar="REPO_ID",
+                   help=f"Hugging Face MLX model id, e.g. '{DEFAULT_MODEL}' "
+                        "(browse https://huggingface.co/mlx-community)")
     p.add_argument("--qwen-coder", action="store_true",
                    help=f"Preset: {QWEN_CODER_MODEL}")
     p.add_argument("--gemma", action="store_true",
