@@ -20,7 +20,7 @@
 #    restart   down + up.
 #    status    Show running state + health.
 #    logs      Tail the server log.
-#    models    List/pull/rm/clean/sync models (sync = register all with pi).
+#    models    List/pull/rm/clean/sync models; `models doctor` = clean + sync.
 #    run       Run the server in the FOREGROUND (Ctrl-C to stop).
 #    pi        Ensure the server is up, then launch the pi agent.
 #    plist     Generate a personalized launchd plist (does NOT install it).
@@ -784,6 +784,14 @@ def cmd_models_clean(args) -> None:
         for r in kept:
             console.print(f"    [yellow]⏳[/] {r}")
 
+def cmd_models_doctor(args) -> None:
+    """One-shot tidy-up: prune stale temp files, then re-align pi's model list
+    with what's actually downloaded. Runs 'clean' then 'sync'."""
+    step("1/2 · Cleaning stale temp files")
+    cmd_models_clean(args)
+    step("2/2 · Aligning pi's model list with the cache")
+    cmd_models_sync(args)
+
 def trim_log() -> None:
     """Cap server.log: if it exceeds LOG_MAX_BYTES, keep only the most recent
     half (snapped to a line boundary) and drop the older head. Best-effort —
@@ -1074,6 +1082,8 @@ def build_parser() -> argparse.ArgumentParser:
     cp.set_defaults(func=cmd_models_clean)
     syp = msub.add_parser("sync", help="register all downloaded models with pi")
     syp.set_defaults(func=cmd_models_sync)
+    dp = msub.add_parser("doctor", help="clean + sync: tidy temp files and re-align pi")
+    dp.set_defaults(func=cmd_models_doctor)
 
     sp = sub.add_parser("run", help="run the server in the foreground")
     add_model_flags(sp); server_opts(sp); sp.set_defaults(func=cmd_run)
@@ -1124,6 +1134,7 @@ def print_overview() -> None:
             ("models rm", "delete a model from the cache to free disk"),
             ("models clean", "remove stale *.incomplete temp files"),
             ("models sync", "register all downloaded models with pi"),
+            ("models doctor", "clean + sync in one step (tidy & re-align)"),
         ]),
         ("Agent & install", [
             ("setup", "install mlx-lm + pi, configure, symlink mlx-pi onto PATH"),

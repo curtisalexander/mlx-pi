@@ -66,6 +66,7 @@ You ──run──▶ ./mlx-pi pi ──HTTP /v1/chat/completions──▶ MLX 
 ./mlx-pi models rm    Delete a model from the cache to free disk.
 ./mlx-pi models clean Remove stale *.incomplete temp files (keeps active downloads).
 ./mlx-pi models sync  Register all downloaded models with pi (so pi's /model lists them).
+./mlx-pi models doctor  Clean + sync in one step: tidy temp files and re-align pi.
 ./mlx-pi run        Run the server in the FOREGROUND (Ctrl-C to stop).
 ./mlx-pi pi         Ensure the server is up, then launch the pi agent.
 ./mlx-pi plist      Generate a launchd plist for auto-start (does NOT install it).
@@ -113,9 +114,10 @@ pi can use **every model you've downloaded**, not just the one from `setup`. The
 
 ```bash
 ./mlx-pi models sync     # rebuild pi's model list from what's in the cache
+./mlx-pi models doctor   # one-shot: clean stale temp files AND re-sync pi
 ```
 
-The model you passed to `setup` (or the existing default) stays pi's **default**; the rest are selectable via `/model`. Restart pi — or use `/model` — to pick up changes made while it's running. In `./mlx-pi models`, the `pi` column shows `▸` for pi's default and `✓` for the other models pi can use.
+`models doctor` is the "just make everything tidy and aligned" button — it runs `clean` then `sync` in one go. The model you passed to `setup` (or the existing default) stays pi's **default**; the rest are selectable via `/model`. Restart pi — or use `/model` — to pick up changes made while it's running. In `./mlx-pi models`, the `pi` column shows `▸` for pi's default and `✓` for the other models pi can use.
 
 ### Hugging Face authentication (`HF_TOKEN`)
 
