@@ -224,7 +224,7 @@
     <p style="margin:0 0 8px"><b>Approx RAM to load = (total params in billions) × (bits ÷ 8) GB, then add ~20–30% headroom for context + the OS.</b></p>
     <div class="kv">
       <dt>30B @ 4-bit</dt><dd>30 × 0.5 = <b>~15 GB</b> weights → budget <b>~18–20 GB</b>. ✅ on 32 GB.</dd>
-      <dt>26B @ 4-bit (Gemma)</dt><dd>≈ <b>15.6 GB</b> on disk → budget <b>~20 GB</b>. ✅ on 32 GB.</dd>
+      <dt>26B @ 8-bit (Gemma)</dt><dd>26 × 1.0 = <b>~26 GB</b> on disk → budget <b>~33 GB</b>. Needs 64 GB. (The <code class="inline">--gemma</code> preset is <b>8-bit</b> for quality; a 4-bit 26B would be ~13 GB → ~17 GB and fit 32 GB.)</dd>
       <dt>70B @ 4-bit</dt><dd>70 × 0.5 = <b>~35 GB</b> → budget <b>~45 GB</b>. Needs 64 GB.</dd>
       <dt>4B @ 4-bit</dt><dd>≈ <b>2.5 GB</b> → trivially fits 16 GB.</dd>
     </div>
@@ -293,7 +293,8 @@ flowchart TB
     PI -->|"reads provider 'local-mlx'"| PICONF
     PI -->|"POST /v1/chat/completions"| SERVER
     SERVER -->|"streams tokens back"| PI
-    MLXLM -->|"you start it"| SERVER
+    MLXLM -->|"you start it (text)"| SERVER
+    MLXVLM -->|"you start it (vision)"| SERVER
     SERVER -->|"loads on first use"| HFCACHE
     HFCACHE -->|"into RAM"| MODEL_MEM
 
@@ -301,7 +302,7 @@ flowchart TB
     classDef run fill:#241a0e,stroke:#5a4424,color:#ffd9a0;
     classDef disk fill:#0f1d13,stroke:#244a2c,color:#bfe7c6;
     classDef you fill:#161b22,stroke:#2a3340,color:#e6edf3;
-    class UV,MLXLM,PI inst;
+    class UV,MLXLM,MLXVLM,PI inst;
     class SERVER,MODEL_MEM run;
     class HFCACHE,PICONF disk;
     class U you;
@@ -335,7 +336,7 @@ flowchart TB
   <div class="note">🔒 <code class="inline">--ignore-scripts</code> is the latest recommended install: pi needs no post-install scripts, so skipping them is faster and avoids running arbitrary lifecycle scripts during install.</div>
 
   <div class="step-h"><div class="dot">4</div><h3>Tell pi about your local server</h3></div>
-  <p><span class="pill once">one-time</span> Register a provider named <code class="inline">local-mlx</code> in <code class="inline">~/.pi/agent/models.json</code>. The <code class="inline">apiKey</code> is required by the OpenAI client but ignored by MLX — any string works.</p>
+  <p><span class="pill once">one-time</span> Register a provider named <code class="inline">local-mlx</code> in <code class="inline">~/.pi/agent/models.json</code>. The <code class="inline">apiKey</code> is required by the OpenAI client but ignored by MLX — any string works. <code class="inline">mlx-pi</code> writes one entry per <b>downloaded</b> model (here, just the small default); <code class="inline">input</code> is <code class="inline">["text","image"]</code> for vision models, <code class="inline">contextWindow</code> is read from each model's <code class="inline">config.json</code>, and <code class="inline">maxTokens</code> matches the server's <code class="inline">--max-tokens</code>.</p>
   <pre><code>{
   <span class="tok-str">"providers"</span>: {
     <span class="tok-str">"local-mlx"</span>: {
@@ -344,15 +345,17 @@ flowchart TB
       <span class="tok-str">"apiKey"</span>: <span class="tok-str">"local-mlx-no-key-needed"</span>,
       <span class="tok-str">"models"</span>: [
         {
-          <span class="tok-str">"id"</span>: <span class="tok-str">"mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit"</span>,
+          <span class="tok-str">"id"</span>: <span class="tok-str">"mlx-community/Qwen3-4B-Instruct-2507-4bit"</span>,
+          <span class="tok-str">"name"</span>: <span class="tok-str">"MLX · Qwen3-4B-Instruct-2507-4bit"</span>,
           <span class="tok-str">"input"</span>: [<span class="tok-str">"text"</span>],
-          <span class="tok-str">"contextWindow"</span>: 131072,
-          <span class="tok-str">"maxTokens"</span>: 8192
+          <span class="tok-str">"contextWindow"</span>: 262144,
+          <span class="tok-str">"maxTokens"</span>: 16384
         }
       ]
     }
   }
 }</code></pre>
+  <div class="note">Which model pi <em>opens on</em> is set separately in <code class="inline">~/.pi/agent/settings.json</code> (<code class="inline">defaultProvider</code> + <code class="inline">defaultModel</code>) — not by the order of this list. <code class="inline">setup</code>, <code class="inline">use</code>, and <code class="inline">pi --&lt;model&gt;</code> write it for you.</div>
 
   <div class="step-h"><div class="dot">5</div><h3>Start the MLX server</h3></div>
   <p><span class="pill daemon">background daemon</span> The first run downloads the model (several GB) into the HF cache, then loads it into memory and starts serving. Subsequent starts just load from disk.</p>
@@ -448,9 +451,9 @@ sequenceDiagram
   <table>
     <tr><th>Concern</th><th>How it works</th></tr>
     <tr><td>Transport</td><td>Plain HTTP to <code class="inline">http://localhost:8080/v1</code>. pi’s <code class="inline">openai-completions</code> API type speaks the OpenAI wire format, which <code class="inline">mlx_lm.server</code> implements.</td></tr>
-    <tr><td>Which model</td><td>The <code class="inline">id</code> in <code class="inline">models.json</code> must match the model the server loaded (<code class="inline">--model</code>). Mismatch → pi asks for a model the server doesn’t have.</td></tr>
+    <tr><td>Which model</td><td>The <code class="inline">id</code> pi sends names the model the server runs. The server preloads its <code class="inline">--model</code> but <b>hot-swaps to whatever id a request names</b> (within the same backend), so a non-preloaded id isn’t an error — it just triggers a reload on first use. <code class="inline">mlx-pi</code> registers every downloaded model, so each id pi can pick is one the server can serve.</td></tr>
     <tr><td>API key</td><td>Required field, ignored by MLX. Use any non-empty placeholder.</td></tr>
-    <tr><td>Switching models</td><td>Inside pi: <code class="inline">/model</code>. To serve a different model, restart the server with a new <code class="inline">--model</code> and add a matching entry to <code class="inline">models.json</code>.</td></tr>
+    <tr><td>Switching models</td><td>Inside pi: <code class="inline">/model</code> (the server reloads the chosen one on the next request). To move <em>both</em> the preloaded model and pi’s default together, use <code class="inline">mlx-pi use &lt;id&gt;</code> outside pi; <code class="inline">mlx-pi models sync</code> re-registers the cache if the list drifts.</td></tr>
     <tr><td>Tools</td><td>pi runs Read/Write/Edit/Bash <em>locally</em> on your machine; only the chat/tool-call messages go to the model. Pick a tool-use-capable model (the Qwen3-Coder default is).</td></tr>
   </table>
 </section>
@@ -488,10 +491,23 @@ sequenceDiagram
       <h3>Memory → model size (rough)</h3>
       <table style="margin-top:6px">
         <tr><th>RAM</th><th>Comfortable model</th></tr>
-        <tr><td>16 GB</td><td>3–4B 4-bit</td></tr>
-        <tr><td>32 GB</td><td>30B-A3B MoE 4-bit (default)</td></tr>
-        <tr><td>64 GB+</td><td>70B-class 4-bit</td></tr>
+        <tr><td>16 GB</td><td>3–4B 4-bit (the default Qwen3 4B)</td></tr>
+        <tr><td>32 GB</td><td>30B-A3B MoE 4-bit (<code class="inline">--qwen-coder</code>)</td></tr>
+        <tr><td>64 GB+</td><td>70B-class 4-bit, or Gemma 26B 8-bit (<code class="inline">--gemma</code>)</td></tr>
       </table>
+    </div>
+    <div class="card">
+      <h3>Manage models &amp; cache</h3>
+      <pre style="margin:0"><code><span class="tok-cmd">./mlx-pi</span> models                 <span class="tok-comment"># list presets + downloaded</span>
+<span class="tok-cmd">./mlx-pi</span> models pull <span class="tok-flag">--gemma</span>     <span class="tok-comment"># download ahead of time</span>
+<span class="tok-cmd">./mlx-pi</span> models rm &lt;id&gt;           <span class="tok-comment"># delete, free disk</span>
+<span class="tok-cmd">./mlx-pi</span> models doctor          <span class="tok-comment"># clean temps + re-sync pi</span></code></pre>
+    </div>
+    <div class="card">
+      <h3>Switch model (server + pi together)</h3>
+      <pre style="margin:0"><code><span class="tok-cmd">./mlx-pi</span> use <span class="tok-flag">--qwen-coder</span>      <span class="tok-comment"># restart server + set pi default</span>
+<span class="tok-cmd">./mlx-pi</span> use &lt;hf-repo-id&gt;
+<span class="tok-cmd">./mlx-pi</span> status                 <span class="tok-comment"># preloaded vs pi default (+ drift)</span></code></pre>
     </div>
   </div>
 </section>

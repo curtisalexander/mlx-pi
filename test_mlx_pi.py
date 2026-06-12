@@ -117,6 +117,21 @@ def backend_selection():
     assert m.generate_bin(m.DEFAULT_MODEL).endswith("mlx_lm.generate")
 
 @test
+def backend_kind_matches_server_backend_vocab():
+    # Regression: cmd_up's "is the running backend wrong?" check compares
+    # server_backend()'s short code ('lm'/'vlm') against a model's expected
+    # backend. backend_kind() is that short code; backend_name() is the full
+    # binary ('mlx_lm.server') and must NOT be used for the comparison — they
+    # never match, which falsely flagged a correct backend and force-restarted.
+    assert m.backend_kind(m.DEFAULT_MODEL) == "lm"
+    assert m.backend_kind(m.GEMMA_MODEL) == "vlm"
+    assert m.backend_name(m.DEFAULT_MODEL) != m.backend_kind(m.DEFAULT_MODEL)
+    # The exact predicate cmd_up uses must be False when the right backend runs.
+    for model in (m.DEFAULT_MODEL, m.GEMMA_MODEL):
+        running = m.backend_kind(model)   # what server_backend(pid) returns
+        assert (running not in (None, m.backend_kind(model))) is False, model
+
+@test
 def resolve_model_precedence():
     os.environ.pop("MLX_MODEL", None)
     ns = argparse.Namespace(qwen_coder=False, gemma=False, model=None)
@@ -281,6 +296,25 @@ def set_pi_default_preserves_other_settings():
 def multimodal_input_in_entry():
     assert m._pi_model_entry(m.GEMMA_MODEL)["input"] == ["text", "image"]
     assert m._pi_model_entry(m.DEFAULT_MODEL)["input"] == ["text"]
+
+@test
+def pi_maxtokens_matches_server_default():
+    # pi must not advertise a larger maxTokens than the server's --max-tokens,
+    # or responses truncate silently. They share DEFAULT_MAX_TOKENS. The big
+    # presets have a 256K context, so no clamp applies — they get the full value.
+    assert m._pi_model_entry(m.DEFAULT_MODEL)["maxTokens"] == m.DEFAULT_MAX_TOKENS
+
+@test
+def maxtokens_clamped_under_small_context():
+    # A small-context model must keep maxTokens well under its window so the
+    # prompt still fits — never claim the whole context for output.
+    saved, m.hf_context_window = m.hf_context_window, lambda repo: 8192
+    try:
+        e = m._pi_model_entry("org/small-ctx")
+        assert e["contextWindow"] == 8192
+        assert e["maxTokens"] == 4096          # min(DEFAULT_MAX_TOKENS, 8192 // 2)
+    finally:
+        m.hf_context_window = saved
 
 
 # --- sync policies: pin mode + RAM guard ------------------------------------

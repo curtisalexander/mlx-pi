@@ -82,7 +82,14 @@ PRESETS = [
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8080
-DEFAULT_MAX_TOKENS = 4096
+# Default generation (output) cap. Used both for the server's --max-tokens (the
+# limit it applies when a request doesn't set one — mlx_lm.server's own default
+# is only ~500) AND advertised to pi as each model's maxTokens, so the two agree.
+# 16384 leaves plenty of room for big coding outputs (whole-file rewrites) without
+# truncating; it's a ceiling, not a target — generation stops at EOS, and MLX's KV
+# cache grows lazily, so a larger value costs no RAM up front. Per-model, the pi
+# entry clamps this under the model's context window (see _pi_model_entry).
+DEFAULT_MAX_TOKENS = 16384
 
 # Fallback context window for pi when we can't read it from a model's config.json
 # (offline, odd config layout, etc.). 131072 = 128K, a common modern default.
@@ -423,14 +430,18 @@ def _env_id_set(var: str) -> set[str]:
 
 def _pi_model_entry(repo: str) -> dict:
     """One pi models.json entry for a model repo id."""
+    ctx = hf_context_window(repo) or DEFAULT_CONTEXT_WINDOW
     return {
         "id": repo,
         "name": f"MLX · {repo.split('/')[-1]}",
         "reasoning": False,
         "input": ["text", "image"] if is_vision_model(repo) else ["text"],
         "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
-        "contextWindow": hf_context_window(repo) or DEFAULT_CONTEXT_WINDOW,
-        "maxTokens": 8192,
+        "contextWindow": ctx,
+        # Keep the output cap under the context window so a small-context model
+        # still has room for the prompt. The big presets (256K ctx) just get the
+        # full DEFAULT_MAX_TOKENS; an 8K-ctx model is held to ~half its window.
+        "maxTokens": min(DEFAULT_MAX_TOKENS, ctx // 2),
     }
 
 def _pi_model_ids(primary: str | None = None, force_primary: bool = False) -> list[str]:
@@ -663,6 +674,13 @@ def backend_name(model: str) -> str:
     """The server binary name that serves `model` (vision → mlx_vlm.server)."""
     return VLM_SERVER if is_vision_model(model) else LM_SERVER
 
+def backend_kind(model: str) -> str:
+    """Short backend code for `model` — 'vlm' or 'lm'. This is the SAME vocabulary
+    server_backend() reads back from a running process, so compare against this
+    (never backend_name(), whose full binary names like 'mlx_lm.server' never
+    equal 'lm' and would falsely flag a correct backend as wrong)."""
+    return "vlm" if is_vision_model(model) else "lm"
+
 def server_bin(model: str | None = None) -> str:
     """Absolute path to the server binary for `model`'s backend (uv installs both
     to ~/.local/bin). With no model, defaults to the text backend."""
@@ -819,9 +837,11 @@ def _print_setup_summary(model: str, linked: bool = True) -> None:
     r = ram_gb()
     console.print(f"\n[bold]Memory note[/] (you have {r} GB):")
     if r >= 64:
-        console.print("  [green]Plenty of headroom — 30B MoE flies; 70B-class 4-bit fits too.[/]")
+        console.print("  [green]Plenty of headroom — --qwen-coder (30B MoE) flies, "
+                      "--gemma (8-bit, ~33 GB) fits, and 70B-class 4-bit too.[/]")
     elif r >= 32:
-        console.print("  [green]Great for --qwen-coder (30B MoE) or --gemma.[/]")
+        console.print("  [green]Great for --qwen-coder (30B MoE, ~20 GB). "
+                      "--gemma (~33 GB) is too big here — it needs 64 GB.[/]")
     elif r >= 16:
         console.print("  [green]The small default Qwen3 4B is ideal here; 30B will be tight.[/]")
     else:
@@ -851,7 +871,7 @@ def cmd_up(args) -> bool:
         # Same model but wrong backend (e.g. a text server on a vision model, so
         # images would fail) is always wrong — fix it regardless of who asked.
         backend_wrong = bool(served == model
-                             and server_backend(pid) not in (None, backend_name(model)))
+                             and server_backend(pid) not in (None, backend_kind(model)))
         switch = model_switch or backend_wrong
         if healthy and not switch:
             ok(f"MLX server is already up & healthy 🟢  →  http://{host}:{port}")
@@ -1265,8 +1285,8 @@ PLIST_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
     <dict>
         <key>PATH</key>
         <string>{home}/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
-        <key>HF_HOME</key>
-        <string>{home}/.cache/huggingface</string>{hf_token_entry}
+        <key>HF_HUB_CACHE</key>
+        <string>{hf_cache}</string>{hf_token_entry}
     </dict>
     <key>RunAtLoad</key>
     <true/>
@@ -1302,6 +1322,7 @@ def cmd_plist(args) -> None:
         host=args.host,
         port=args.port,
         home=str(Path.home()),
+        hf_cache=str(HF_CACHE),
         state=str(STATE_DIR),
         hf_token_entry=hf_token_entry,
     )
