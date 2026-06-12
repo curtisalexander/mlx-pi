@@ -68,9 +68,10 @@ console = Console()
 # DEFAULT model: a small (~2 GB) Qwen3 4B 4-bit. Downloads in seconds — perfect
 # for confirming the whole MLX<->pi pipeline works before committing to a big
 # model. Override with --model, or the --qwen-coder / --gemma presets.
-DEFAULT_MODEL = "mlx-community/Qwen3-4B-Instruct-2507-4bit"
-QWEN_CODER_MODEL = "mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit"  # ~16 GB
-GEMMA_MODEL = "mlx-community/gemma-4-26b-a4b-it-4bit"                 # ~15.6 GB, text+image
+# (Sizes below are exact on-disk figures from HF; `mlx-pi models` shows them live.)
+DEFAULT_MODEL = "mlx-community/Qwen3-4B-Instruct-2507-4bit"           # 2.1 GB
+QWEN_CODER_MODEL = "mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit"  # 16.0 GB
+GEMMA_MODEL = "mlx-community/gemma-4-26b-a4b-it-8bit"                 # 26.1 GB, text+image
 
 # The built-in presets, shown by `mlx-pi models`: (flag, repo id, modality).
 PRESETS = [
@@ -82,6 +83,10 @@ PRESETS = [
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8080
 DEFAULT_MAX_TOKENS = 4096
+
+# Fallback context window for pi when we can't read it from a model's config.json
+# (offline, odd config layout, etc.). 131072 = 128K, a common modern default.
+DEFAULT_CONTEXT_WINDOW = 131072
 
 # pi reads providers/models from here. We register a provider named "local-mlx".
 PI_PROVIDER_ID = "local-mlx"
@@ -187,6 +192,49 @@ def hf_model_size_bytes(repo: str) -> int | None:
         return total or None
     except Exception:
         return None
+
+def _cached_config(repo: str) -> dict | None:
+    """Read a downloaded model's config.json from the local HF cache, if present.
+    Avoids a network round-trip (and works offline) for models we already have."""
+    snaps = HF_CACHE / f"models--{repo.replace('/', '--')}" / "snapshots"
+    if not snaps.is_dir():
+        return None
+    for snap in snaps.iterdir():
+        cfg = snap / "config.json"
+        if cfg.is_file():
+            try:
+                return json.loads(cfg.read_text())
+            except (OSError, json.JSONDecodeError):
+                return None
+    return None
+
+def _ctx_from_config(cfg: dict) -> int | None:
+    """Pull the context length out of a HF config.json. Tries the common keys,
+    including the text_config sub-config that VLMs nest their text model under."""
+    for src in (cfg, cfg.get("text_config", {}), cfg.get("llm_config", {})):
+        if not isinstance(src, dict):
+            continue
+        for key in ("max_position_embeddings", "n_positions", "n_ctx",
+                    "max_sequence_length", "seq_length"):
+            val = src.get(key)
+            if isinstance(val, int) and val > 0:
+                return val
+    return None
+
+def hf_context_window(repo: str) -> int | None:
+    """The model's max context length, from its config.json. Reads the local
+    cache first (offline-friendly), else fetches config.json from HF. None on
+    failure, so callers can fall back to DEFAULT_CONTEXT_WINDOW."""
+    cfg = _cached_config(repo)
+    if cfg is None:
+        url = f"https://huggingface.co/{repo}/resolve/main/config.json"
+        try:
+            r = httpx.get(url, timeout=15, follow_redirects=True)
+            r.raise_for_status()
+            cfg = r.json()
+        except Exception:
+            return None
+    return _ctx_from_config(cfg)
 
 def model_is_cached(repo: str) -> bool:
     """True if the model already exists in the local HF cache (nothing to download)."""
@@ -381,7 +429,7 @@ def _pi_model_entry(repo: str) -> dict:
         "reasoning": False,
         "input": ["text", "image"] if is_vision_model(repo) else ["text"],
         "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
-        "contextWindow": 131072,
+        "contextWindow": hf_context_window(repo) or DEFAULT_CONTEXT_WINDOW,
         "maxTokens": 8192,
     }
 
@@ -1022,12 +1070,17 @@ def cmd_pi(args) -> None:
 # ============================================================================
 
 def _download_cell(repo: str) -> str:
-    """Rendered 'Downloaded' column for a repo, by cache status."""
+    """Rendered 'Downloaded' column for a repo, by cache status. For models not
+    yet on disk, fall back to a live Hugging Face query so the table still shows
+    the real download size (offline / unknown id → '— not yet')."""
     s = model_status(repo)
     if s == "complete":
         return f"[green]✅ {_size(cache_size_bytes(repo))}[/]"
     if s == "partial":
         return f"[yellow]⏳ partial ({_size(cache_size_bytes(repo))} so far)[/]"
+    remote = hf_model_size_bytes(repo)
+    if remote:
+        return f"[dim]⬇ {_size(remote)} on HF[/]"
     return "[dim]— not yet[/]"
 
 def cmd_models(args) -> None:

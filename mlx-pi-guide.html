@@ -230,14 +230,14 @@
     </div>
     <div class="warnbox" style="margin-top:12px">For MoE models, size against <b>total</b> params (the model is fully resident in RAM); the <code class="inline">A#B</code> active count only affects <em>speed</em>, not memory. Apple Silicon’s unified memory is shared with the GPU, so a model that “fits” still needs room left for your apps — leave a comfortable margin.</div>
   </div>
-  <p class="lead" style="margin-top:14px">Tip: a model card on Hugging Face shows exact file sizes under <b>“Files and versions”</b> — sum the <code class="inline">.safetensors</code> shards for the real on-disk/in-RAM number, which beats any estimate.</p>
+  <p class="lead" style="margin-top:14px">Disk figures above are exact (summed from Hugging Face); RAM is an estimate (~disk&nbsp;×&nbsp;1.25). For live numbers run <code class="inline">mlx-pi models</code> — it shows the on-disk size of downloaded models and a live HF size for ones you haven't pulled yet. (A model card's <b>“Files and versions”</b> tab is the manual equivalent: sum the <code class="inline">.safetensors</code> shards.)</p>
 
   <h3>2.5 — Quick picks (and the script presets)</h3>
   <table>
     <tr><th>Goal</th><th>Model id</th><th>Flag</th><th>Size / RAM</th></tr>
-    <tr><td><b>Test the pipeline (default)</b></td><td><code class="inline">mlx-community/Qwen3-4B-Instruct-2507-4bit</code></td><td><em>(default)</em></td><td>~2 GB / ~16 GB</td></tr>
-    <tr><td>Coding agent</td><td><code class="inline">mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit</code></td><td><code class="inline">--qwen-coder</code></td><td>~16 GB / ~32 GB</td></tr>
-    <tr><td>General + vision</td><td><code class="inline">mlx-community/gemma-4-26b-a4b-it-4bit</code></td><td><code class="inline">--gemma</code></td><td>~15.6 GB / ~32 GB</td></tr>
+    <tr><td><b>Test the pipeline (default)</b></td><td><code class="inline">mlx-community/Qwen3-4B-Instruct-2507-4bit</code></td><td><em>(default)</em></td><td>2.1 GB / ~3 GB</td></tr>
+    <tr><td>Coding agent</td><td><code class="inline">mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit</code></td><td><code class="inline">--qwen-coder</code></td><td>16.0 GB / ~20 GB</td></tr>
+    <tr><td>General + vision</td><td><code class="inline">mlx-community/gemma-4-26b-a4b-it-8bit</code></td><td><code class="inline">--gemma</code></td><td>26.1 GB / ~33 GB</td></tr>
     <tr><td>Anything else</td><td>any MLX repo id</td><td><code class="inline">--model &lt;id&gt;</code></td><td>varies</td></tr>
   </table>
   <p class="lead">The default is deliberately tiny so you can confirm the whole MLX↔pi loop works in minutes, then switch up with <code class="inline">--qwen-coder</code> for real coding work.</p>

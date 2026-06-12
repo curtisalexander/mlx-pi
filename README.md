@@ -90,10 +90,12 @@ Run `./mlx-pi <command> --help` for the flags on any subcommand.
 
 | Flag | Model | Disk / RAM |
 |------|-------|-----------|
-| *(default)* | `mlx-community/Qwen3-4B-Instruct-2507-4bit` | ~2 GB / ~16 GB |
-| `--qwen-coder` | `mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit` | ~16 GB / ~32 GB |
-| `--gemma` | `mlx-community/gemma-4-26b-a4b-it-4bit` (text+image) | ~15.6 GB / ~32 GB |
+| *(default)* | `mlx-community/Qwen3-4B-Instruct-2507-4bit` | 2.1 GB / ~3 GB |
+| `--qwen-coder` | `mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit` | 16.0 GB / ~20 GB |
+| `--gemma` | `mlx-community/gemma-4-26b-a4b-it-8bit` (text+image) | 26.1 GB / ~33 GB |
 | `--model <id>` | any MLX repo from Hugging Face | varies |
+
+Disk figures are exact (summed from Hugging Face); RAM is an estimate (~disk × 1.25). Run `mlx-pi models` for live sizes — it shows the on-disk size of downloaded models and a live HF size for ones you haven't pulled yet.
 
 `--gemma` is a **vision** model — `mlx-pi` serves it on the `mlx_vlm.server` backend so you can paste images into pi; text models use Apple's `mlx_lm.server`. See [Text vs vision backends](#text-vs-vision-backends-images).
 
