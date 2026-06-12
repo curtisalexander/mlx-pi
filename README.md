@@ -60,24 +60,24 @@ You ──run──▶ ./mlx-pi pi ──HTTP /v1/chat/completions──▶ MLX 
 ## Commands
 
 ```text
-./mlx-pi setup      Install mlx-lm + mlx-vlm + pi, point pi at the local server, and symlink mlx-pi onto your PATH (--no-link to skip).
-./mlx-pi up         Start the MLX server in the background; wait until healthy.
-./mlx-pi down       Stop the background server.
-./mlx-pi restart    down + up.
-./mlx-pi use        Switch the served model AND pi's default together (download if needed; --pin to lock pi to it).
-./mlx-pi status     Show running state + health (flags drift between the served model and pi's default).
-./mlx-pi logs       Tail the server log.
-./mlx-pi models       List preset + downloaded models, and what pi is set to use.
-./mlx-pi models pull  Download a model to the cache (no server; resumes partials).
-./mlx-pi models rm    Delete a model from the cache to free disk.
-./mlx-pi models clean Remove stale *.incomplete temp files (keeps active downloads).
-./mlx-pi models sync  Register all downloaded models with pi (so pi's /model lists them).
+./mlx-pi setup          Install mlx-lm + mlx-vlm + pi, point pi at the local server, and symlink mlx-pi onto your PATH (--no-link to skip).
+./mlx-pi up             Start the MLX server in the background; wait until healthy.
+./mlx-pi down           Stop the background server.
+./mlx-pi restart        down + up.
+./mlx-pi use            Switch the served model AND pi's default together (download if needed; --pin to lock pi to it).
+./mlx-pi status         Show running state + health (flags drift between the served model and pi's default).
+./mlx-pi logs           Tail the server log.
+./mlx-pi models         List preset + downloaded models, and what pi is set to use.
+./mlx-pi models pull    Download a model to the cache (no server; resumes partials).
+./mlx-pi models rm      Delete a model from the cache to free disk.
+./mlx-pi models clean   Remove stale *.incomplete temp files (keeps active downloads).
+./mlx-pi models sync    Register all downloaded models with pi (so pi's /model lists them).
 ./mlx-pi models doctor  Clean + sync in one step: tidy temp files and re-align pi.
-./mlx-pi run        Run the server in the FOREGROUND (Ctrl-C to stop).
-./mlx-pi pi         Ensure the server is up, then launch the pi agent.
-./mlx-pi plist      Generate a launchd plist for auto-start (does NOT install it).
-./mlx-pi install    Symlink mlx-pi into ~/.local/bin so `mlx-pi` works anywhere.
-./mlx-pi uninstall  Remove that symlink.
+./mlx-pi run            Run the server in the FOREGROUND (Ctrl-C to stop).
+./mlx-pi pi             Ensure the server is up, then launch the pi agent.
+./mlx-pi plist          Generate a launchd plist for auto-start (does NOT install it).
+./mlx-pi install        Symlink mlx-pi into ~/.local/bin so `mlx-pi` works anywhere.
+./mlx-pi uninstall      Remove that symlink.
 ```
 
 Run `./mlx-pi <command> --help` for the flags on any subcommand.
