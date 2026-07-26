@@ -2,7 +2,7 @@
 
 Run LLMs **locally** on Apple Silicon (M-series) with [MLX](https://github.com/ml-explore/mlx) as the inference engine and [pi](https://github.com/earendil-works/pi) as the coding agent. No cloud, no API keys, no token costs — once a model is downloaded you can run fully offline.
 
-> 📖 For the full illustrated walkthrough (architecture diagrams, how to read a Hugging Face model card, quantization, launchd, troubleshooting), read the **[online guide](https://curtisalexander.github.io/mlx-pi/)** — or open the source [`mlx-pi-guide.html`](./mlx-pi-guide.html) in a browser.
+> 📖 For the full illustrated walkthrough (architecture diagrams, how to read a Hugging Face model card, quantization, launchd, troubleshooting), read the **[online guide](https://curtisalexander.github.io/mlx-pi/)** — or open [`mlx-pi-guide.html`](./mlx-pi-guide.html) in a browser. The HTML uses Mermaid from a CDN, so diagrams require network access and the file is not fully offline/self-contained.
 
 ---
 
@@ -33,7 +33,7 @@ The default model is a small **Qwen3 4B** (~2 GB) so you can confirm the whole p
 |------|---------|
 | `bootstrap.sh` | ~5-line shell script. Installs `uv` and nothing else. Must be shell because a fresh Mac ships neither `uv` nor a reliable `python3`. |
 | `mlx-pi` | The single tool you actually use. A Python CLI run via `uv run` (deps `rich` + `httpx` are declared inline and built automatically on first run). |
-| `mlx-pi-guide.html` | Self-contained visual guide with diagrams. |
+| `mlx-pi-guide.html` | Visual guide with diagrams (Mermaid is loaded from a CDN). |
 | `index.html` | Redirect to the guide, so GitHub Pages serves it at the repo's Pages URL. |
 | `README.md` | This file. |
 | `LICENSE` | MIT license. |
@@ -52,7 +52,7 @@ You ──run──▶ ./mlx-pi pi ──HTTP /v1/chat/completions──▶ MLX 
 - **`./mlx-pi setup`** installs two MLX server backends globally (via `uv tool install`, so their CLIs work from any folder) and **pi** (via npm), then writes a `local-mlx` provider into `~/.pi/agent/models.json` pointing at `http://localhost:8080/v1`:
   - **mlx-lm** (Apple's [ml-explore](https://github.com/ml-explore/mlx-lm)) — runs **text-only** LLMs via `mlx_lm.server`.
   - **mlx-vlm** (community [Blaizzy/mlx-vlm](https://github.com/Blaizzy/mlx-vlm)) — runs **vision** models (text **+ images**) via `mlx_vlm.server`. It's the only backend that accepts image input.
-- **`./mlx-pi up`** runs the **right backend for your model** as a background daemon — `mlx_vlm.server` for a vision model like Gemma, `mlx_lm.server` for a text model like Qwen — loading it into memory behind one OpenAI-compatible API. Both speak the same `/v1` endpoints, so pi (and `up`/`status`/`use`) treat them identically; `mlx-pi` just picks the binary. It's the only long-running process.
+- **`./mlx-pi up`** runs the **right backend for your model** as a background daemon — `mlx_vlm.server` for a vision model like Gemma, `mlx_lm.server` for a text model like Qwen — loading it into memory behind an OpenAI-compatible chat API. Their readiness behavior differs: `mlx-pi` polls `/health`, then verifies mlx-vlm's loaded model or makes one tiny mlx-lm completion before reporting startup complete. It's the only long-running process.
 - **pi** sends prompts to that local endpoint instead of the cloud, and runs its Read/Write/Edit/Bash tools locally on your machine.
 
 ---
@@ -120,14 +120,14 @@ Run **`./mlx-pi models`** any time to see the presets, which are downloaded (wit
 
 ### Multiple models in pi
 
-pi can use **every model you've downloaded**, not just the one from `setup`. The `local-mlx` provider in `~/.pi/agent/models.json` is registered with all your downloaded models, so inside pi you can `/model` between them. The list stays in sync automatically: `setup` and `models pull` register newly-downloaded models, and `models rm` removes them. If you ever download a model another way (or pi's list looks stale), run:
+pi lists downloaded models that are compatible with the **active/default backend**, not every cached model. This prevents a text server from being offered vision-only models (and vice versa). Switch backend and model together with `mlx-pi use <model>`. The list stays in sync automatically: `setup` and `models pull` update `~/.pi/agent/models.json`, `models rm` removes entries, and pi's `/model` reloads that file without requiring a restart. If you download a model another way (or the list looks stale), run:
 
 ```bash
 ./mlx-pi models sync     # rebuild pi's model list from what's in the cache
 ./mlx-pi models doctor   # one-shot: clean stale temp files AND re-sync pi
 ```
 
-`models doctor` is the "just make everything tidy and aligned" button — it runs `clean` then `sync` in one go. The model you passed to `setup` (or the existing default) stays pi's **default**; the rest are selectable via `/model`. Restart pi — or use `/model` — to pick up changes made while it's running. In `./mlx-pi models`, the `pi` column shows `▸` for pi's default and `✓` for the other models pi can use.
+`models doctor` is the "just make everything tidy and aligned" button — it runs `clean` then `sync` in one go. The model you passed to `setup` (or the existing default) stays pi's **default**; compatible downloaded models are selectable via `/model`. In `./mlx-pi models`, the `pi` column shows `▸` for pi's default and `✓` for the other models pi can use.
 
 ### Text vs vision backends (images)
 
@@ -140,7 +140,7 @@ Some models are **vision** models — they accept images, not just text (e.g. **
 
 You don't choose the backend — `mlx-pi up --gemma` launches `mlx_vlm.server`, `mlx-pi up --qwen-coder` launches `mlx_lm.server`. The same model's image capability is advertised to pi to match, so pi only offers image paste when the backend can actually handle it. `./mlx-pi status` shows which backend is live (`backend  vision · mlx_vlm.server (images ✅)`), and `./mlx-pi models` lists each model's modality.
 
-Detection is a **name heuristic** (Gemma 4, `*-VL`, `llava`, `pixtral`, `idefics`, `moondream`, `smolvlm`, anything with `vision`). If a model is misclassified, override it:
+Detection is **metadata-first**: cached Hugging Face `config.json` metadata is used when decisive, then a name heuristic handles unknown/custom configs. Explicit environment overrides remain available:
 
 ```bash
 export MLX_VISION_MODELS=org/my-vlm-with-an-odd-name   # force vision backend
@@ -157,7 +157,7 @@ There are two separate things to keep aligned: which model the **server preloade
 
 - **`./mlx-pi up --<model>` / `pi --<model>`** — when an explicit model differs from the one a running server has, they **restart the server onto it** instead of just warning (a bare `up` leaves the running server alone). `pi --<model>` additionally sets pi's `defaultModel`, so the server and pi open on the same model.
 - **`./mlx-pi use <model>`** moves both sides together *without launching pi*: downloads if needed, restarts the server on it, and sets it as pi's `defaultModel`. The deliberate "switch everything to this model" command.
-- **`./mlx-pi status`** shows the **preloaded** model, the **backend** serving it, and **pi's default** side by side, and warns when the model and pi's default differ (pi's first request would force a reload). It can't show the *currently-resident* model after a swap — the server neither exposes nor logs it.
+- **`./mlx-pi status`** shows the **preloaded** model, the **backend** serving it, and **pi's default** side by side, and warns when the model and pi's default differ. mlx-vlm's `/health` can report its resident model; mlx-lm readiness does not expose equivalent resident-model information.
 - **Pinned mode** (`--pin` on `setup`/`use`, or `export MLX_PIN_MODEL=1`) registers **only** the served model with pi, so pi's picker can't drift to something that triggers a surprise reload. Good default on low-RAM machines.
 - **RAM guard** (on by default) hides models from pi's picker that clearly won't fit in your installed RAM, so selecting one can't OOM the box. The model you explicitly chose is always kept, and hidden models are reported (not silently dropped). Disable with `export MLX_NO_RAM_GUARD=1`.
 
@@ -185,9 +185,11 @@ set -Ux HF_TOKEN hf_xxxxx       # fish (universal, persists)
 ```bash
 ./mlx-pi plist --qwen-coder                                   # generate
 cp com.mlx-pi.server.plist ~/Library/LaunchAgents/            # install
-launchctl load ~/Library/LaunchAgents/com.mlx-pi.server.plist # enable
-launchctl unload ~/Library/LaunchAgents/com.mlx-pi.server.plist  # disable later
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.mlx-pi.server.plist # enable
+launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.mlx-pi.server.plist   # disable later
 ```
+
+The generated plist is written with mode `0600`, particularly important when it contains a plaintext `HF_TOKEN`.
 
 > ⚠️ A launchd server is **always on** — it holds the model in RAM from login. Great on a dedicated machine; on a laptop you may prefer manual `up`/`down`.
 
@@ -218,7 +220,7 @@ All optional — sensible defaults otherwise.
 | `MLX_NO_RAM_GUARD` | `1` to register models even if they likely exceed installed RAM (the guard is on by default). |
 | `MLX_VISION_MODELS` | Comma-separated repo ids to force onto the **vision** backend (`mlx_vlm.server`) when the name heuristic misses. |
 | `MLX_TEXT_MODELS` | Comma-separated repo ids to force onto the **text** backend (`mlx_lm.server`), overriding vision detection. |
-| `MLX_STATE_DIR` | Where the PID file and server log live (default `~/.mlx-pi`). |
+| `MLX_STATE_DIR` | Where versioned ownership state (`server.json`) and the server log live (default `~/.mlx-pi`). The CLI validates process identity; it does not trust a bare PID. |
 | `MLX_LOG_MAX_BYTES` | Cap for `server.log` before it's trimmed (default `10485760` = 10 MB). |
 | `MLX_STARTUP_TIMEOUT` | Seconds `up` waits for the server to become healthy before giving up (default `600`). |
 | `HF_TOKEN` | Hugging Face token for gated models / higher download rate limits (see above). |
@@ -232,4 +234,6 @@ All optional — sensible defaults otherwise.
 - macOS with `curl` (preinstalled)
 - Internet access for the one-time installs and model downloads
 
-Everything else (`uv`, `mlx-lm`, Node, `pi`, Python deps) is installed by the two scripts.
+The scripts install `uv`, both MLX backends, pi, and Python dependencies. If Node is missing, `setup` installs it through Homebrew when available; otherwise install Node LTS first.
+
+By default the API binds only to loopback. A non-loopback `--host` is refused unless you explicitly pass `--allow-network`; doing so exposes an **unauthenticated API** to any network that can reach that address.

@@ -16,7 +16,11 @@ size formatting, and multi-model pi registration.
 import argparse
 import importlib.util
 import io
+import json
 import os
+import plistlib
+import shutil
+import stat
 import sys
 import tempfile
 from importlib.machinery import SourceFileLoader
@@ -56,6 +60,15 @@ def fresh_pi():
     m.PI_SETTINGS_FILE = tmp / "settings.json"  # else tests clobber real settings
     return tmp
 
+def fresh_state():
+    tmp = Path(tempfile.mkdtemp())
+    m.STATE_DIR = tmp
+    m.STATE_FILE = tmp / "server.json"
+    m.LEGACY_PID_FILE = tmp / "server.pid"
+    m.CONTROL_LOCK_FILE = tmp / "control.lock"
+    m.LOG_FILE = tmp / "server.log"
+    return tmp
+
 def make_model(cache, repo, *, complete=True, stale_incomplete=False,
                active_incomplete=False, blob_size=1024):
     """Create a fake HF cache dir for `repo`. A *.incomplete temp is 'stale' if
@@ -67,7 +80,8 @@ def make_model(cache, repo, *, complete=True, stale_incomplete=False,
         snaps = d / "snapshots" / "rev0"
         snaps.mkdir(parents=True)
         blob = blobs / ("a" * 64)
-        blob.write_bytes(b"x" * blob_size)
+        with open(blob, "wb") as f:
+            f.truncate(blob_size)  # sparse: large fake models consume no real RAM/disk
         (snaps / "model.safetensors").symlink_to(blob)
     if stale_incomplete:  # final blob ('a'*64) present -> stale
         (blobs / ("a" * 64 + ".deadbeef.incomplete")).write_bytes(b"y" * 256)
@@ -367,6 +381,303 @@ def fits_ram_unknown_never_blocks():
         assert m._fits_ram("org/whatever") is True
     finally:
         m.ram_gb = saved_ram
+
+
+# --- correctness hardening -------------------------------------------------
+@test
+def metadata_and_context_are_conservative():
+    assert m._ctx_from_config({"max_position_embeddings": True}) is None
+    assert m._ctx_from_config({"max_position_embeddings": 512}) is None
+    assert m._ctx_from_config({"max_position_embeddings": 32768}) == 32768
+    assert m._vision_from_config({"vision_config": {"hidden_size": 1}}) is True
+    assert m._vision_from_config({"architectures": ["TextForCausalLM"]}) is False
+    saved, m.hf_context_window = m.hf_context_window, lambda repo: None
+    try:
+        entry = m._pi_model_entry("org/unknown")
+        assert entry["contextWindow"] == 32768
+        assert entry["maxTokens"] == 16384
+    finally:
+        m.hf_context_window = saved
+
+@test
+def pi_models_are_filtered_to_primary_backend():
+    c = fresh_cache(); fresh_pi()
+    make_model(c, "org/text")
+    make_model(c, "org/Qwen2-VL")
+    m.configure_pi("org/text", "http://localhost:8080/v1")
+    assert m.configured_model_ids() == ["org/text"]
+    m.configure_pi("org/Qwen2-VL", "http://localhost:8080/v1")
+    assert m.configured_model_ids() == ["org/Qwen2-VL"]
+
+@test
+def deleting_default_promotes_compatible_replacement():
+    c = fresh_cache(); fresh_pi()
+    make_model(c, "org/a"); make_model(c, "org/b")
+    m.configure_pi("org/a", "http://localhost:8080/v1")
+    shutil.rmtree(c / "models--org--a")
+    assert m.refresh_pi_models() == 1
+    assert m.configured_model_ids() == ["org/b"]
+    assert m.configured_model_id() == "org/b"
+
+@test
+def deleting_only_default_clears_owned_settings():
+    c = fresh_cache(); fresh_pi()
+    make_model(c, "org/a")
+    m.configure_pi("org/a", "http://localhost:8080/v1")
+    settings = m.pi_settings(); settings["packages"] = ["keep"]
+    m.PI_SETTINGS_FILE.write_text(json.dumps(settings))
+    shutil.rmtree(c / "models--org--a")
+    assert m.refresh_pi_models() == 0
+    settings = m.pi_settings()
+    assert "defaultProvider" not in settings and "defaultModel" not in settings
+    assert settings["packages"] == ["keep"]
+
+@test
+def atomic_write_is_private_and_complete():
+    path = Path(tempfile.mkdtemp()) / "state.json"
+    m._atomic_write_json(path, {"complete": True})
+    assert json.loads(path.read_text()) == {"complete": True}
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+@test
+def stale_process_identity_is_never_signaled():
+    fresh_state()
+    state = {"version": 1, "instance": "old", "pid": 123, "pgid": 123,
+             "started": "then", "command": "mlx_lm.server --model org/a",
+             "backend": "lm", "model": "org/a", "host": "127.0.0.1", "port": 8080}
+    m._atomic_write_json(m.STATE_FILE, state)
+    saved_identity, saved_killpg = m._process_identity, m.os.killpg
+    calls = []
+    m._process_identity = lambda pid: {"started": "now", "pgid": pid, "command": "sleep 99"}
+    m.os.killpg = lambda *args: calls.append(args)
+    try:
+        assert m._stop_locked() is False
+        assert calls == []
+        assert not m.STATE_FILE.exists()
+    finally:
+        m._process_identity, m.os.killpg = saved_identity, saved_killpg
+
+@test
+def matching_process_state_is_recognized():
+    fresh_state()
+    identity = {"started": "now", "pgid": 456, "command": "mlx_lm.server --model org/a"}
+    state = {"version": 1, "instance": "x", "pid": 456, **identity,
+             "backend": "lm", "model": "org/a", "host": "127.0.0.1", "port": 8080}
+    m._atomic_write_json(m.STATE_FILE, state)
+    saved = m._process_identity; m._process_identity = lambda pid: identity
+    try:
+        assert m.server_pid() == 456
+        assert m.served_model(456) == "org/a"
+        assert m.server_backend(456) == "lm"
+    finally:
+        m._process_identity = saved
+
+@test
+def readiness_uses_health_and_checks_vlm_model():
+    class Response:
+        status_code = 200
+        def __init__(self, data): self._data = data
+        def json(self): return self._data
+    payload = {"status": "healthy", "loaded_model": "org/right"}
+    class Client:
+        def __init__(self, **kwargs): assert kwargs["trust_env"] is False
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def get(self, url):
+            assert url.endswith("/health")
+            return Response(payload)
+        def post(self, url, json):
+            assert url.endswith("/v1/chat/completions") and json["max_tokens"] == 1
+            return Response({})
+    saved = m.httpx.Client; m.httpx.Client = Client
+    try:
+        assert m.server_ready("0.0.0.0", 8080, "vlm", "org/right") is True
+        assert m.server_ready("0.0.0.0", 8080, "vlm", "org/wrong") is False
+        assert m.server_ready("127.0.0.1", 8080, "lm", "org/any") is True
+    finally:
+        m.httpx.Client = saved
+
+@test
+def lm_wait_issues_exactly_one_generation_probe():
+    calls = {"get": 0, "post": 0}
+    class Response:
+        status_code = 200
+        def json(self): return {"status": "ok"}
+    class Client:
+        def __init__(self, **kwargs): pass
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def get(self, url): calls["get"] += 1; return Response()
+        def post(self, url, json): calls["post"] += 1; return Response()
+    saved = m.httpx.Client; m.httpx.Client = Client
+    try:
+        assert m._wait_until_ready("127.0.0.1", 8080, "lm", "org/a",
+                                   m.time.monotonic() + 5, lambda: True)
+        assert calls["get"] == 1 and calls["post"] == 1
+    finally:
+        m.httpx.Client = saved
+
+@test
+def generated_plist_round_trips_and_is_private():
+    tmp = fresh_state(); fresh_cache()
+    out = tmp / "server.plist"
+    args = argparse.Namespace(model="org/a&b", qwen_coder=False, gemma=False,
+                              host="127.0.0.1", port=8080, output=str(out),
+                              allow_network=False)
+    old = os.environ.get("HF_TOKEN")
+    os.environ["HF_TOKEN"] = "token<&>"
+    try:
+        m.cmd_plist(args)
+        data = plistlib.loads(out.read_bytes())
+        assert "org/a&b" in data["ProgramArguments"]
+        assert data["EnvironmentVariables"]["HF_TOKEN"] == "token<&>"
+        assert stat.S_IMODE(out.stat().st_mode) == 0o600
+    finally:
+        if old is None:
+            os.environ.pop("HF_TOKEN", None)
+        else:
+            os.environ["HF_TOKEN"] = old
+
+@test
+def uninstall_preserves_foreign_symlink():
+    tmp = Path(tempfile.mkdtemp())
+    foreign = tmp / "foreign"; foreign.write_text("x")
+    link = tmp / "mlx-pi"; link.symlink_to(foreign)
+    m.cmd_uninstall(argparse.Namespace(dir=str(tmp)))
+    assert link.is_symlink()
+
+@test
+def validation_rejects_bad_ports_and_network_bind():
+    assert m._port("1") == 1 and m._port("65535") == 65535
+    for value in ("0", "65536", "nope"):
+        try:
+            m._port(value)
+            assert False, value
+        except argparse.ArgumentTypeError:
+            pass
+    assert m._network_bind_allowed(argparse.Namespace(host="localhost", allow_network=False))
+    assert not m._network_bind_allowed(argparse.Namespace(host="0.0.0.0", allow_network=False))
+
+@test
+def empty_provider_never_mixes_backends():
+    c = fresh_cache(); fresh_pi(); fresh_state()
+    make_model(c, "org/text")
+    make_model(c, "org/Qwen2-VL")
+    m.PI_CONFIG_FILE.write_text(json.dumps({"providers": {m.PI_PROVIDER_ID: {
+        "baseUrl": "http://localhost:8080/v1", "api": "openai-completions",
+        "apiKey": "x", "models": [],
+    }}}))
+    assert m.refresh_pi_models() == 1
+    ids = m.configured_model_ids()
+    assert len(ids) == 1
+
+@test
+def malformed_settings_are_never_overwritten():
+    fresh_pi()
+    m.PI_SETTINGS_FILE.write_text("{broken")
+    try:
+        m.set_pi_default("org/a")
+        assert False
+    except SystemExit:
+        pass
+    assert m.PI_SETTINGS_FILE.read_text() == "{broken"
+
+@test
+def invalid_timeout_cannot_spawn_server():
+    fresh_state()
+    args = argparse.Namespace(host="127.0.0.1", port=8080, model=None,
+                              qwen_coder=False, gemma=False)
+    saved_popen = m.subprocess.Popen
+    calls = []
+    m.subprocess.Popen = lambda *a, **k: calls.append((a, k))
+    old = os.environ.get("MLX_STARTUP_TIMEOUT")
+    os.environ["MLX_STARTUP_TIMEOUT"] = "bad"
+    try:
+        try:
+            m._start_locked(args, m.DEFAULT_MODEL)
+            assert False
+        except SystemExit:
+            pass
+        assert calls == [] and not m.STATE_FILE.exists()
+    finally:
+        m.subprocess.Popen = saved_popen
+        if old is None: os.environ.pop("MLX_STARTUP_TIMEOUT", None)
+        else: os.environ["MLX_STARTUP_TIMEOUT"] = old
+
+@test
+def invalid_log_limit_cannot_stop_owned_server():
+    fresh_state()
+    identity = {"started": "now", "pgid": 778, "command": "mlx_lm.server --model org/a"}
+    state = {"version": 1, "instance": "x", "phase": "ready", "pid": 778, **identity,
+             "backend": "lm", "model": "org/a", "host": "127.0.0.1", "port": 8080}
+    m._atomic_write_json(m.STATE_FILE, state)
+    args = argparse.Namespace(host="127.0.0.1", port=8080, model="org/a",
+                              qwen_coder=False, gemma=False)
+    saved_identity, saved_killpg, saved_popen = m._process_identity, m.os.killpg, m.subprocess.Popen
+    calls = []
+    m._process_identity = lambda pid: identity
+    m.os.killpg = lambda *a: calls.append(("kill", a))
+    m.subprocess.Popen = lambda *a, **k: calls.append(("spawn", a, k))
+    old = os.environ.get("MLX_LOG_MAX_BYTES")
+    os.environ["MLX_LOG_MAX_BYTES"] = "bad"
+    try:
+        try:
+            m._start_locked(args, "org/a", force_restart=True)
+            assert False
+        except SystemExit:
+            pass
+        assert calls == [] and m.STATE_FILE.exists()
+    finally:
+        m._process_identity, m.os.killpg, m.subprocess.Popen = saved_identity, saved_killpg, saved_popen
+        if old is None: os.environ.pop("MLX_LOG_MAX_BYTES", None)
+        else: os.environ["MLX_LOG_MAX_BYTES"] = old
+
+@test
+def recovered_starting_state_requires_real_readiness():
+    fresh_state()
+    identity = {"started": "now", "pgid": 779, "command": "mlx_lm.server --model org/a"}
+    state = {"version": 1, "instance": "x", "phase": "starting", "pid": 779, **identity,
+             "backend": "lm", "model": "org/a", "host": "127.0.0.1", "port": 8080}
+    m._atomic_write_json(m.STATE_FILE, state)
+    args = argparse.Namespace(host="127.0.0.1", port=8080, model=None,
+                              qwen_coder=False, gemma=False)
+    saved = (m._process_identity, m.is_healthy, m._wait_until_ready, m._stop_locked)
+    stopped = []
+    m._process_identity = lambda pid: identity
+    m.is_healthy = lambda host, port: True
+    m._wait_until_ready = lambda *a, **k: False
+    m._stop_locked = lambda: stopped.append(True) or True
+    try:
+        assert m._start_locked(args, "org/a") is False
+        assert stopped == [True]
+        assert json.loads(m.STATE_FILE.read_text())["phase"] == "starting"
+    finally:
+        (m._process_identity, m.is_healthy, m._wait_until_ready, m._stop_locked) = saved
+
+@test
+def bare_up_preserves_owned_nondefault_without_default_preflight():
+    fresh_state()
+    identity = {"started": "now", "pgid": 777, "command": "mlx_vlm.server --model org/VL"}
+    state = {"version": 1, "instance": "x", "pid": 777, **identity,
+             "backend": "vlm", "model": "org/VL", "host": "127.0.0.1", "port": 8080}
+    m._atomic_write_json(m.STATE_FILE, state)
+    args = argparse.Namespace(host="127.0.0.1", port=8080, model=None,
+                              qwen_coder=False, gemma=False, yes=False,
+                              allow_network=False)
+    saved = (m._process_identity, m.is_healthy, m._start_locked,
+             m.require_backend, m.confirm_download)
+    called = []
+    m._process_identity = lambda pid: identity
+    m.is_healthy = lambda host, port: True
+    m._start_locked = lambda args, model: called.append(model) or True
+    m.require_backend = lambda model: (_ for _ in ()).throw(AssertionError("preflight"))
+    m.confirm_download = lambda model, yes: (_ for _ in ()).throw(AssertionError("prompt"))
+    try:
+        assert m.cmd_up(args) is True
+        assert called == ["org/VL"]
+    finally:
+        (m._process_identity, m.is_healthy, m._start_locked,
+         m.require_backend, m.confirm_download) = saved
 
 
 def main():

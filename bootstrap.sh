@@ -29,6 +29,8 @@ if command -v uv >/dev/null 2>&1; then
   echo "  ${G}✅ uv already installed ($(uv --version))${R}"
 else
   echo "  ${Y}⬇️  Installing uv (Astral's static binary → ~/.local/bin)…${R}"
+  # Security: this trusts Astral's official HTTPS installer; no independent
+  # checksum verification is performed here.
   curl -LsSf https://astral.sh/uv/install.sh | sh
   # Make uv visible to the rest of THIS shell session.
   export PATH="$HOME/.local/bin:$PATH"
@@ -44,7 +46,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 echo
 echo "${B}✅ Bootstrap done.${R} Next:"
-echo "  ${C}./mlx-pi setup${R}      ${D}# install mlx-lm + pi, configure everything${R}"
+echo "  ${C}./mlx-pi setup${R}      ${D}# install both MLX backends + pi; configure (no model download)${R}"
 echo "  ${C}./mlx-pi up${R}         ${D}# start the local model server${R}"
 echo "  ${C}./mlx-pi pi${R}         ${D}# launch the coding agent against it${R}"
 echo

@@ -41,16 +41,23 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import difflib
+import fcntl
+import ipaddress
 import json
 import os
 import platform
+import plistlib
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
+import tempfile
 import time
+import uuid
 from pathlib import Path
 
 import httpx
@@ -91,9 +98,10 @@ DEFAULT_PORT = 8080
 # entry clamps this under the model's context window (see _pi_model_entry).
 DEFAULT_MAX_TOKENS = 16384
 
-# Fallback context window for pi when we can't read it from a model's config.json
-# (offline, odd config layout, etc.). 131072 = 128K, a common modern default.
-DEFAULT_CONTEXT_WINDOW = 131072
+# Conservative fallback when a model does not publish usable context metadata.
+# Pi trusts this value when trimming conversations, so over-advertising it can
+# make requests fail. Known models still use their real config.json value.
+DEFAULT_CONTEXT_WINDOW = 32768
 
 # pi reads providers/models from here. We register a provider named "local-mlx".
 PI_PROVIDER_ID = "local-mlx"
@@ -106,15 +114,86 @@ PI_SETTINGS_FILE = PI_CONFIG_DIR / "settings.json"
 
 # Runtime state (pid + logs) lives here, surviving across terminals.
 STATE_DIR = Path(os.environ.get("MLX_STATE_DIR", Path.home() / ".mlx-pi"))
-PID_FILE = STATE_DIR / "server.pid"
+STATE_FILE = STATE_DIR / "server.json"
+# Old releases wrote only a PID. It is deliberately never trusted for signaling:
+# a reused PID could belong to an unrelated process.
+LEGACY_PID_FILE = STATE_DIR / "server.pid"
+CONTROL_LOCK_FILE = STATE_DIR / "control.lock"
 LOG_FILE = STATE_DIR / "server.log"
 # The log is appended to across every `up`, so cap its size. When it exceeds
 # this, we keep the most recent half and drop the older head. Override the cap
 # (in bytes) with MLX_LOG_MAX_BYTES.
-LOG_MAX_BYTES = int(os.environ.get("MLX_LOG_MAX_BYTES", 10 * 1024 * 1024))  # 10 MB
+DEFAULT_LOG_MAX_BYTES = 10 * 1024 * 1024
 
 # npm package for the pi coding agent (latest recommended install).
 PI_NPM_PKG = "@earendil-works/pi-coding-agent"
+
+
+def _positive_env_int(name: str, default: int) -> int:
+    """Read a positive integer environment setting with an actionable error."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        err(f"{name} must be a positive integer; got {raw!r}.")
+        raise SystemExit(2)
+    if value <= 0:
+        err(f"{name} must be greater than zero; got {value}.")
+        raise SystemExit(2)
+    return value
+
+
+def _atomic_write(path: Path, content: str | bytes, mode: int = 0o600) -> None:
+    """Atomically replace a file so interruption never leaves partial state."""
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        os.fchmod(fd, mode)
+        binary = isinstance(content, bytes)
+        with os.fdopen(fd, "wb" if binary else "w") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_name, path)
+        os.chmod(path, mode)
+        try:
+            dfd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+        except OSError:
+            pass
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        Path(tmp_name).unlink(missing_ok=True)
+        raise
+
+
+def _atomic_write_json(path: Path, data: dict) -> None:
+    _atomic_write(path, json.dumps(data, indent=2) + "\n")
+
+
+@contextlib.contextmanager
+def _file_lock(path: Path, *, blocking: bool = True):
+    """Advisory lock shared by cooperating mlx-pi processes."""
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with open(path, "a+") as f:
+        os.chmod(path, 0o600)
+        flags = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
+        try:
+            fcntl.flock(f.fileno(), flags)
+        except BlockingIOError:
+            raise RuntimeError("another mlx-pi operation is already in progress")
+        try:
+            yield
+        finally:
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
 def _hf_cache_dir() -> Path:
     """Resolve the HF hub cache the same way huggingface_hub does, so we look
@@ -206,7 +285,16 @@ def _cached_config(repo: str) -> dict | None:
     snaps = HF_CACHE / f"models--{repo.replace('/', '--')}" / "snapshots"
     if not snaps.is_dir():
         return None
-    for snap in snaps.iterdir():
+    base = snaps.parent
+    candidates: list[Path] = []
+    try:
+        revision = (base / "refs" / "main").read_text().strip()
+        if revision:
+            candidates.append(snaps / revision)
+    except OSError:
+        pass
+    candidates.extend(s for s in snaps.iterdir() if s not in candidates)
+    for snap in candidates:
         cfg = snap / "config.json"
         if cfg.is_file():
             try:
@@ -224,7 +312,7 @@ def _ctx_from_config(cfg: dict) -> int | None:
         for key in ("max_position_embeddings", "n_positions", "n_ctx",
                     "max_sequence_length", "seq_length"):
             val = src.get(key)
-            if isinstance(val, int) and val > 0:
+            if isinstance(val, int) and not isinstance(val, bool) and 1024 <= val <= 10_000_000:
                 return val
     return None
 
@@ -358,7 +446,13 @@ def resolve_model(args) -> str:
         return GEMMA_MODEL
     if getattr(args, "model", None):
         return args.model
-    return os.environ.get("MLX_MODEL", DEFAULT_MODEL)
+    env_model = os.environ.get("MLX_MODEL")
+    if env_model is not None:
+        if not env_model.strip():
+            err("MLX_MODEL cannot be empty.")
+            raise SystemExit(2)
+        return env_model.strip()
+    return DEFAULT_MODEL
 
 def resolve_target_model(args) -> str:
     """Like resolve_model, but a positional REPO_ID (on `models pull`/`rm`) wins."""
@@ -366,13 +460,41 @@ def resolve_target_model(args) -> str:
 
 def add_model_flags(p: argparse.ArgumentParser) -> None:
     """Attach the common model-selection flags to a subparser."""
-    p.add_argument("-m", "--model", metavar="REPO_ID",
-                   help=f"Hugging Face MLX model id, e.g. '{DEFAULT_MODEL}' "
-                        "(browse https://huggingface.co/mlx-community)")
-    p.add_argument("--qwen-coder", action="store_true",
-                   help=f"Preset: {QWEN_CODER_MODEL}")
-    p.add_argument("--gemma", action="store_true",
-                   help=f"Preset: {GEMMA_MODEL} (text+image)")
+    group = p.add_mutually_exclusive_group()
+    group.add_argument("-m", "--model", metavar="REPO_ID",
+                       help=f"Hugging Face MLX model id, e.g. '{DEFAULT_MODEL}' "
+                            "(browse https://huggingface.co/mlx-community)")
+    group.add_argument("--qwen-coder", action="store_true",
+                       help=f"Preset: {QWEN_CODER_MODEL}")
+    group.add_argument("--gemma", action="store_true",
+                       help=f"Preset: {GEMMA_MODEL} (text+image)")
+
+def _port(value: str) -> int:
+    try:
+        port = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("port must be an integer")
+    if not 1 <= port <= 65535:
+        raise argparse.ArgumentTypeError("port must be between 1 and 65535")
+    return port
+
+def _is_loopback_host(host: str) -> bool:
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+def _network_bind_allowed(args) -> bool:
+    if _is_loopback_host(args.host):
+        return True
+    if getattr(args, "allow_network", False):
+        warn(f"Binding to {args.host} exposes an unauthenticated model API to the network.")
+        return True
+    err(f"Refusing non-loopback bind {args.host!r} without --allow-network.")
+    info("MLX's server has only basic security checks; use a firewall or trusted network.")
+    return False
 
 
 # ============================================================================
@@ -412,17 +534,43 @@ def is_vision_model(repo: str) -> bool:
     This is the single source of truth that decides BOTH which server backend
     runs the model (mlx_vlm.server for vision, mlx_lm.server for text-only) AND
     whether pi advertises image input — so the two can never disagree. It's a
-    name heuristic (we can't load the model just to ask); override per-model with
-    MLX_VISION_MODELS / MLX_TEXT_MODELS (comma-separated repo ids) when a name
-    fools it."""
-    if repo in _env_id_set("MLX_VISION_MODELS"):
+    cached config metadata is preferred over the name heuristic; explicit env
+    overrides remain authoritative for unusual repositories."""
+    forced_vision = _env_id_set("MLX_VISION_MODELS")
+    forced_text = _env_id_set("MLX_TEXT_MODELS")
+    if repo in forced_vision and repo in forced_text:
+        err(f"{repo} appears in both MLX_VISION_MODELS and MLX_TEXT_MODELS.")
+        raise SystemExit(2)
+    if repo in forced_vision:
         return True
-    if repo in _env_id_set("MLX_TEXT_MODELS"):
+    if repo in forced_text:
         return False
+    cfg = _cached_config(repo)
+    if cfg is not None:
+        detected = _vision_from_config(cfg)
+        if detected is not None:
+            return detected
     r = repo.lower()
     return (repo == GEMMA_MODEL or "gemma-4" in r or "-vl" in r or "vision" in r
             or "llava" in r or "pixtral" in r or "idefics" in r or "moondream" in r
             or "smolvlm" in r or "-vlm" in r)
+
+def _vision_from_config(cfg: dict) -> bool | None:
+    """Infer modality from common Hugging Face model metadata when decisive."""
+    if isinstance(cfg.get("vision_config"), dict):
+        return True
+    values = [cfg.get("model_type", "")]
+    values.extend(cfg.get("architectures") or [])
+    text = " ".join(str(v).lower() for v in values)
+    vision_markers = ("vision", "vlconditional", "llava", "pixtral", "idefics",
+                      "moondream", "smolvlm", "qwen2vl", "qwen3vl", "gemma4")
+    if any(marker in text.replace("_", "") for marker in vision_markers):
+        return True
+    # A recognized causal-LM architecture without a vision section is useful
+    # negative evidence. Unknown/custom configs fall back to the name heuristic.
+    if any(marker in text for marker in ("causallm", "forcausallm")):
+        return False
+    return None
 
 def _env_id_set(var: str) -> set[str]:
     """Comma/space-separated repo ids from an env var, as a set (empty if unset)."""
@@ -444,16 +592,19 @@ def _pi_model_entry(repo: str) -> dict:
         "maxTokens": min(DEFAULT_MAX_TOKENS, ctx // 2),
     }
 
-def _pi_model_ids(primary: str | None = None, force_primary: bool = False) -> list[str]:
+def _pi_model_ids(primary: str | None = None, force_primary: bool = False,
+                  backend: str | None = None) -> list[str]:
     """Repo ids to expose to pi: `primary` first (if forced, or already
-    downloaded), then every other fully-downloaded model in the cache — so pi
-    sees every model you've installed and defaults to the one you chose.
+    downloaded), then compatible fully-downloaded models in the cache.
 
     Two policies can trim that list:
       • pinned mode (MLX_PIN_MODEL)  → only the primary, so pi can't drift.
       • RAM guard (on by default)    → drop models that clearly won't fit in
         RAM, EXCEPT the primary (you explicitly asked for that one)."""
-    complete = sorted(r for r in _present_repo_ids() if model_status(r) == "complete")
+    backend = backend or (backend_kind(primary) if primary else None)
+    complete = sorted(r for r in _present_repo_ids()
+                      if model_status(r) == "complete"
+                      and (backend is None or backend_kind(r) == backend))
     kept_primary = primary if (primary and (force_primary or primary in complete)) else None
     if _pin_enabled() and kept_primary:
         return [kept_primary]
@@ -473,8 +624,10 @@ def _ram_dropped(ids: list[str]) -> list[str]:
     the user instead of silently hiding them ('no silent caps')."""
     if not _ram_guard_enabled():
         return []
+    backend = backend_kind(ids[0]) if ids else None
     return [r for r in sorted(_present_repo_ids())
-            if model_status(r) == "complete" and r not in ids and not _fits_ram(r)]
+            if model_status(r) == "complete" and r not in ids and not _fits_ram(r)
+            and (backend is None or backend_kind(r) == backend)]
 
 def _warn_ram_dropped(ids: list[str]) -> None:
     """Best-effort heads-up about models hidden from pi for not fitting in RAM."""
@@ -488,38 +641,65 @@ def _warn_ram_dropped(ids: list[str]) -> None:
         tag = f"  [dim](~{est:.0f} GB to load)[/]" if est else ""
         console.print(f"    [yellow]🧠[/] {r}{tag}")
 
+def _warn_backend_dropped(ids: list[str]) -> None:
+    if not ids:
+        return
+    backend = backend_kind(ids[0])
+    dropped = [r for r in sorted(_present_repo_ids())
+               if model_status(r) == "complete" and backend_kind(r) != backend]
+    if dropped:
+        label = "vision" if backend == "vlm" else "text"
+        info(f"pi lists only {label}-backend models while this backend is active; "
+             f"switch others with 'mlx-pi use <model>'.")
+
+def _pi_lock_path() -> Path:
+    return PI_CONFIG_DIR / ".mlx-pi.lock"
+
+def _backup(path: Path) -> Path:
+    backup = path.with_suffix(f"{path.suffix}.bak.{time.time_ns()}")
+    _atomic_write(backup, path.read_bytes())
+    for old in sorted(path.parent.glob(f"{path.name}.bak.*"))[:-5]:
+        old.unlink(missing_ok=True)
+    return backup
+
+def _read_json_or_abort(path: Path) -> dict:
+    try:
+        data = json.loads(path.read_text())
+        if not isinstance(data, dict):
+            raise ValueError("top level is not an object")
+        return data
+    except Exception as exc:
+        backup = _backup(path)
+        err(f"Refusing to overwrite malformed JSON in {path}: {exc}")
+        info(f"A copy was saved as {backup.name}; repair the file and retry.")
+        raise SystemExit(1)
+
 def configure_pi(model: str, base_url: str) -> None:
     """Write/merge the local-mlx provider into pi's models.json (native JSON — no
-    heredocs!). Registers every downloaded model, defaulting to `model`."""
-    PI_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    ids = _pi_model_ids(primary=model, force_primary=True)
-    provider = {
-        "baseUrl": base_url,
-        "api": "openai-completions",
-        "apiKey": "local-mlx-no-key-needed",  # required by client, ignored by MLX
-        "models": [_pi_model_entry(r) for r in ids],
-    }
-    if PI_CONFIG_FILE.exists():
-        backup = PI_CONFIG_FILE.with_suffix(f".json.bak.{int(time.time())}")
-        backup.write_text(PI_CONFIG_FILE.read_text())
-        info(f"Existing config backed up → {backup.name}")
-        # Keep only the 5 most recent backups so they don't pile up over time.
-        old = sorted(PI_CONFIG_DIR.glob("models.json.bak.*"))[:-5]
-        for f in old:
-            f.unlink(missing_ok=True)
-        try:
-            data = json.loads(PI_CONFIG_FILE.read_text())
-        except Exception:
+    heredocs!). Registers the selected model plus compatible downloads."""
+    PI_CONFIG_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    ids = _pi_model_ids(primary=model, force_primary=True, backend=backend_kind(model))
+    with _file_lock(_pi_lock_path()):
+        provider = {
+            "baseUrl": base_url,
+            "api": "openai-completions",
+            "apiKey": "local-mlx-no-key-needed",  # required by client, ignored by MLX
+            "models": [_pi_model_entry(r) for r in ids],
+        }
+        if PI_CONFIG_FILE.exists():
+            backup = _backup(PI_CONFIG_FILE)
+            info(f"Existing config backed up → {backup.name}")
+            data = _read_json_or_abort(PI_CONFIG_FILE)
+        else:
             data = {}
-    else:
-        data = {}
-    data.setdefault("providers", {})[PI_PROVIDER_ID] = provider
-    PI_CONFIG_FILE.write_text(json.dumps(data, indent=2))
-    set_pi_default(model)  # make the chosen model pi's actual startup default
+        data.setdefault("providers", {})[PI_PROVIDER_ID] = provider
+        _atomic_write_json(PI_CONFIG_FILE, data)
+        _set_pi_default_unlocked(model)
     suffix = "  [dim](pinned: only this model)[/]" if _pin_enabled() else ""
     ok(f"Configured provider '{PI_PROVIDER_ID}' with {len(ids)} model(s) → {base_url}{suffix}")
     info(f"pi will open on [bold]{model}[/] by default.")
     _warn_ram_dropped(ids)
+    _warn_backend_dropped(ids)
 
 def refresh_pi_models(primary: str | None = None, force_primary: bool = False) -> int | None:
     """Rewrite the local-mlx provider's model list from the cache, preserving its
@@ -527,23 +707,40 @@ def refresh_pi_models(primary: str | None = None, force_primary: bool = False) -
     Returns the new model count, or None if pi isn't configured yet."""
     if not PI_CONFIG_FILE.exists():
         return None
-    try:
-        data = json.loads(PI_CONFIG_FILE.read_text())
-    except Exception:
-        return None
-    prov = data.get("providers", {}).get(PI_PROVIDER_ID)
-    if not isinstance(prov, dict):
-        return None
-    if primary is None:  # keep the existing default model first, if still present
-        cur = prov.get("models") or []
-        if cur:
-            primary = cur[0].get("id")
-    ids = _pi_model_ids(primary=primary, force_primary=force_primary)
-    prov["models"] = [_pi_model_entry(r) for r in ids]
-    PI_CONFIG_FILE.write_text(json.dumps(data, indent=2))
-    if force_primary and primary:  # an explicit switch → also move pi's default
-        set_pi_default(primary)
+    with _file_lock(_pi_lock_path()):
+        data = _read_json_or_abort(PI_CONFIG_FILE)
+        prov = data.get("providers", {}).get(PI_PROVIDER_ID)
+        if not isinstance(prov, dict):
+            return None
+        settings = pi_settings()
+        global_default = (settings.get("defaultModel")
+                          if settings.get("defaultProvider") == PI_PROVIDER_ID else None)
+        if primary is None:
+            primary = global_default
+            if not primary:
+                cur = prov.get("models") or []
+                primary = cur[0].get("id") if cur else None
+        if primary is None:
+            state = _read_server_state()
+            complete = sorted(r for r in _present_repo_ids() if model_status(r) == "complete")
+            if _state_is_owned(state):
+                same_backend = [r for r in complete if backend_kind(r) == state["backend"]]
+                primary = same_backend[0] if same_backend else None
+            elif complete:
+                primary = complete[0]
+        backend = backend_kind(primary) if primary else None
+        ids = _pi_model_ids(primary=primary, force_primary=force_primary, backend=backend)
+        prov["models"] = [_pi_model_entry(r) for r in ids]
+        _atomic_write_json(PI_CONFIG_FILE, data)
+        if force_primary and primary:
+            _set_pi_default_unlocked(primary)
+        elif global_default and global_default not in ids:
+            if ids:
+                _set_pi_default_unlocked(ids[0])
+            else:
+                _clear_pi_default_unlocked()
     _warn_ram_dropped(ids)
+    _warn_backend_dropped(ids)
     return len(ids)
 
 def pi_settings() -> dict:
@@ -558,16 +755,30 @@ def set_pi_default(model: str) -> None:
     settings.json (defaultProvider + defaultModel), NOT the models.json list
     order — so writing here is what actually changes which model pi opens with.
     Merges (preserving other settings) and keeps the 5 most recent backups."""
-    PI_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    with _file_lock(_pi_lock_path()):
+        _set_pi_default_unlocked(model)
+
+def _set_pi_default_unlocked(model: str) -> None:
+    PI_CONFIG_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
     if PI_SETTINGS_FILE.exists():
-        backup = PI_SETTINGS_FILE.with_suffix(f".json.bak.{int(time.time())}")
-        backup.write_text(PI_SETTINGS_FILE.read_text())
-        for f in sorted(PI_CONFIG_DIR.glob("settings.json.bak.*"))[:-5]:
-            f.unlink(missing_ok=True)
-    s = pi_settings()
+        s = _read_json_or_abort(PI_SETTINGS_FILE)
+        _backup(PI_SETTINGS_FILE)
+    else:
+        s = {}
     s["defaultProvider"] = PI_PROVIDER_ID
     s["defaultModel"] = model
-    PI_SETTINGS_FILE.write_text(json.dumps(s, indent=2))
+    _atomic_write_json(PI_SETTINGS_FILE, s)
+
+def _clear_pi_default_unlocked() -> None:
+    if not PI_SETTINGS_FILE.exists():
+        return
+    s = _read_json_or_abort(PI_SETTINGS_FILE)
+    if s.get("defaultProvider") != PI_PROVIDER_ID:
+        return
+    _backup(PI_SETTINGS_FILE)
+    s.pop("defaultProvider", None)
+    s.pop("defaultModel", None)
+    _atomic_write_json(PI_SETTINGS_FILE, s)
 
 def configured_model_id() -> str | None:
     """pi's actual startup model. Read from settings.json (defaultProvider +
@@ -603,58 +814,136 @@ def align_pi_default(model: str, port: int) -> int | None:
 
 
 # ============================================================================
-#  Server process management (PID file + health checks + log helpers)
+#  Server process management (owned state + health checks + log helpers)
 # ============================================================================
 
-def server_pid() -> int | None:
-    if not PID_FILE.exists():
-        return None
+def _read_server_state() -> dict | None:
     try:
-        pid = int(PID_FILE.read_text().strip())
+        state = json.loads(STATE_FILE.read_text())
+        return state if state.get("version") == 1 else None
     except Exception:
         return None
-    # os.kill(pid, 0) raises if the process is gone.
+
+def _process_identity(pid: int) -> dict | None:
+    """Opaque process identity used to reject stale/reused PIDs before signals."""
     try:
-        os.kill(pid, 0)
-        return pid
-    except OSError:
+        env = {**os.environ, "LC_ALL": "C"}
+        started = subprocess.check_output(
+            ["ps", "-ww", "-p", str(pid), "-o", "lstart="], text=True, env=env,
+        ).strip()
+        pgid = int(subprocess.check_output(
+            ["ps", "-ww", "-p", str(pid), "-o", "pgid="], text=True, env=env,
+        ).strip())
+        command = subprocess.check_output(
+            ["ps", "-ww", "-p", str(pid), "-o", "command="], text=True, env=env,
+        ).strip()
+        if not started or not command:
+            return None
+        return {"started": started, "pgid": pgid, "command": command}
+    except Exception:
         return None
+
+def _state_is_owned(state: dict | None) -> bool:
+    if not state:
+        return False
+    identity = _process_identity(state.get("pid", -1))
+    if not identity:
+        return False
+    return (identity.get("started") == state.get("started")
+            and identity.get("pgid") == state.get("pgid") == state.get("pid")
+            and identity.get("command") == state.get("command")
+            and state.get("backend") in ("lm", "vlm"))
+
+def _remove_state(instance: str | None = None) -> None:
+    current = _read_server_state()
+    if instance is None or (current and current.get("instance") == instance):
+        STATE_FILE.unlink(missing_ok=True)
+
+def server_pid() -> int | None:
+    state = _read_server_state()
+    if _state_is_owned(state):
+        return state["pid"]
+    if state:
+        _remove_state(state.get("instance"))
+    return None
+
+def _probe_host(host: str) -> str:
+    if host == "0.0.0.0":
+        return "127.0.0.1"
+    if host == "::":
+        return "::1"
+    return host
+
+def _local_url(host: str, port: int, path: str) -> str:
+    host = _probe_host(host)
+    rendered = f"[{host}]" if ":" in host and not host.startswith("[") else host
+    return f"http://{rendered}:{port}{path}"
+
+def _port_in_use(host: str, port: int) -> bool:
+    probe = _probe_host(host)
+    family = socket.AF_INET6 if ":" in probe else socket.AF_INET
+    try:
+        with socket.socket(family, socket.SOCK_STREAM) as sock:
+            sock.settimeout(0.25)
+            return sock.connect_ex((probe, port)) == 0
+    except OSError:
+        return False
 
 def is_healthy(host: str, port: int) -> bool:
     try:
-        r = httpx.get(f"http://{host}:{port}/v1/models", timeout=2)
-        return r.status_code == 200
+        with httpx.Client(trust_env=False, timeout=2) as client:
+            r = client.get(_local_url(host, port, "/health"))
+        return r.status_code == 200 and r.json().get("status") in ("ok", "healthy")
     except Exception:
         return False
 
-def served_model(pid: int) -> str | None:
-    """The model the running server was launched with, read from its argv. The
-    /v1/models endpoint lists every cached model (mlx_lm can hot-swap per
-    request), so it can't tell us the loaded one — the process args can."""
+def server_ready(host: str, port: int, backend: str, model: str,
+                 timeout: float = 2) -> bool:
+    """One backend-specific startup probe (caller polls liveness separately)."""
     try:
-        # -ww: don't truncate the command line to terminal width.
-        out = subprocess.check_output(["ps", "-ww", "-p", str(pid), "-o", "command="], text=True)
+        with httpx.Client(trust_env=False, timeout=timeout) as client:
+            if backend == "vlm":
+                r = client.get(_local_url(host, port, "/health"))
+                if r.status_code != 200:
+                    return False
+                data = r.json()
+                if data.get("status") not in ("ok", "healthy"):
+                    return False
+                return data.get("loaded_model") == model
+            # mlx-lm's /health is liveness only; a tiny completion proves that
+            # asynchronous model loading has finished before pi is launched.
+            probe = client.post(
+                _local_url(host, port, "/v1/chat/completions"),
+                json={"model": model, "messages": [{"role": "user", "content": "Reply ok."}],
+                      "max_tokens": 1, "stream": False},
+            )
+            return probe.status_code == 200
     except Exception:
-        return None
-    parts = out.split()
-    if "--model" in parts:
-        i = parts.index("--model")
-        if i + 1 < len(parts):
-            return parts[i + 1]
-    return None
+        return False
+
+def _wait_until_ready(host: str, port: int, backend: str, model: str,
+                      deadline: float, alive) -> bool:
+    """Poll cheap liveness, then make at most one LM generation request."""
+    while time.monotonic() < deadline:
+        if not alive():
+            return False
+        if backend == "vlm":
+            if server_ready(host, port, backend, model):
+                return alive()
+        elif is_healthy(host, port):
+            remaining = max(0.1, deadline - time.monotonic())
+            return server_ready(host, port, backend, model, timeout=remaining) and alive()
+        console.print(f"  [dim]…still warming up[/]", end="\r")
+        time.sleep(1)
+    return False
+
+def served_model(pid: int) -> str | None:
+    state = _read_server_state()
+    return state.get("model") if _state_is_owned(state) and state.get("pid") == pid else None
 
 def server_backend(pid: int) -> str | None:
-    """Which backend the running server is — 'vlm', 'lm', or None — from its
-    argv. Lets status show whether images are actually supported right now."""
-    try:
-        out = subprocess.check_output(["ps", "-ww", "-p", str(pid), "-o", "command="], text=True)
-    except Exception:
-        return None
-    if VLM_SERVER in out:
-        return "vlm"
-    if LM_SERVER in out:
-        return "lm"
-    return None
+    state = _read_server_state()
+    return state.get("backend") if _state_is_owned(state) and state.get("pid") == pid else None
 
 def _model_requested(args) -> bool:
     """True if the user explicitly chose a model (flag or MLX_MODEL), vs the
@@ -665,8 +954,8 @@ def _model_requested(args) -> bool:
 # Two backends, picked per-model by is_vision_model():
 #   • mlx_lm.server  (Apple's ml-explore) — text-only LLMs.
 #   • mlx_vlm.server (community: Blaizzy/mlx-vlm) — Vision-Language Models, the
-#     only one of the two that accepts image input. Both are OpenAI-compatible
-#     (same --model/--host/--port/--max-tokens flags, same /v1/models health).
+#     only one of the two that accepts image input. Both expose the OpenAI-compatible
+#     chat route pi needs, but their health/readiness details differ.
 LM_SERVER = "mlx_lm.server"
 VLM_SERVER = "mlx_vlm.server"
 
@@ -702,14 +991,15 @@ def require_backend(model: str) -> None:
                       "[cyan]./mlx-pi setup[/]), then open a new terminal.[/]")
         sys.exit(1)
 
-def trim_log() -> None:
+def trim_log(limit: int | None = None) -> None:
     """Cap server.log: if it exceeds LOG_MAX_BYTES, keep only the most recent
     half (snapped to a line boundary) and drop the older head. Best-effort —
     any error here must never block starting the server."""
     try:
-        if not LOG_FILE.exists() or LOG_FILE.stat().st_size <= LOG_MAX_BYTES:
+        limit = limit or _positive_env_int("MLX_LOG_MAX_BYTES", DEFAULT_LOG_MAX_BYTES)
+        if not LOG_FILE.exists() or LOG_FILE.stat().st_size <= limit:
             return
-        keep = LOG_MAX_BYTES // 2
+        keep = limit // 2
         with open(LOG_FILE, "rb") as f:
             f.seek(-keep, os.SEEK_END)
             tail = f.read()
@@ -718,7 +1008,7 @@ def trim_log() -> None:
         if nl != -1:
             tail = tail[nl + 1:]
         with open(LOG_FILE, "wb") as f:
-            f.write(b"--- log trimmed (exceeded %d bytes) ---\n" % LOG_MAX_BYTES)
+            f.write(b"--- log trimmed (exceeded %d bytes) ---\n" % limit)
             f.write(tail)
     except OSError:
         pass
@@ -855,45 +1145,114 @@ def _print_setup_summary(model: str, linked: bool = True) -> None:
 #  SUBCOMMANDS: server lifecycle — up / down / restart / status / logs / run / pi
 # ============================================================================
 
-def cmd_up(args) -> bool:
-    model = resolve_model(args)
-    require_backend(model)
+def _terminate_owned(state: dict, proc: subprocess.Popen | None = None) -> bool:
+    """Stop exactly the process group represented by verified state."""
+    if not _state_is_owned(state):
+        return False
+    try:
+        os.killpg(state["pgid"], signal.SIGTERM)
+    except OSError:
+        pass
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if proc is not None and proc.poll() is not None:
+            break
+        if proc is None and not _state_is_owned(state):
+            break
+        time.sleep(0.2)
+    else:
+        if _state_is_owned(state):
+            warn("Graceful stop timed out — force killing the owned process group.")
+            try:
+                os.killpg(state["pgid"], signal.SIGKILL)
+            except OSError:
+                pass
+    if proc is not None:
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
+    _remove_state(state.get("instance"))
+    return True
+
+def _terminate_spawn(proc: subprocess.Popen) -> None:
+    """Best-effort cleanup before owned state has been safely published."""
+    if proc.poll() is None:
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except OSError:
+            proc.terminate()
+    try:
+        proc.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            proc.kill()
+        proc.wait(timeout=2)
+
+def _stop_locked() -> bool:
+    state = _read_server_state()
+    if not state:
+        if LEGACY_PID_FILE.exists():
+            warn(f"Found legacy {LEGACY_PID_FILE.name}; it cannot be safely verified "
+                 "and will not be signaled. Removing the stale tracking file.")
+            LEGACY_PID_FILE.unlink(missing_ok=True)
+        info("No running server tracked. (Already off 🔴)")
+        return False
+    if not _state_is_owned(state):
+        warn("Tracked server identity no longer matches that process — refusing to signal it.")
+        _remove_state(state.get("instance"))
+        return False
+    info(f"Stopping MLX server (PID {state['pid']})…")
+    _terminate_owned(state)
+    ok("MLX server stopped 🔴")
+    return True
+
+def _start_locked(args, model: str, *, force_restart: bool = False) -> bool:
+    timeout = _positive_env_int("MLX_STARTUP_TIMEOUT", 600)
+    log_limit = _positive_env_int("MLX_LOG_MAX_BYTES", DEFAULT_LOG_MAX_BYTES)
     host, port = args.host, args.port
-
-    pid = server_pid()
-    if pid:
-        healthy = is_healthy(host, port)
-        served = served_model(pid) if healthy else None
-        # If the user explicitly asked for a different model than the one running,
-        # honor it: restart onto it instead of just warning. (A bare `up` with no
-        # model request leaves the running server alone — no surprise reload.)
-        model_switch = bool(_model_requested(args) and served and served != model)
-        # Same model but wrong backend (e.g. a text server on a vision model, so
-        # images would fail) is always wrong — fix it regardless of who asked.
-        backend_wrong = bool(served == model
-                             and server_backend(pid) not in (None, backend_kind(model)))
-        switch = model_switch or backend_wrong
-        if healthy and not switch:
-            ok(f"MLX server is already up & healthy 🟢  →  http://{host}:{port}")
-            if served:
-                info(f"Currently serving: [bold]{served}[/]")
+    expected_backend = backend_kind(model)
+    state = _read_server_state()
+    if state and _state_is_owned(state):
+        healthy = is_healthy(state["host"], state["port"])
+        explicit_model_change = _model_requested(args) and state["model"] != model
+        endpoint_change = state["host"] != host or state["port"] != port
+        backend_change = _model_requested(args) and state["backend"] != expected_backend
+        changed = explicit_model_change or endpoint_change or backend_change
+        if not force_restart and not changed and state.get("phase") == "ready" and healthy:
+            ok(f"MLX server is already up & healthy 🟢  →  {_local_url(host, port, '')}")
+            info(f"Currently serving: [bold]{state['model']}[/]")
             return True
-        if model_switch:
-            info(f"Server is serving [bold]{served}[/], but you asked for "
-                 f"[bold]{model}[/] — restarting onto it.")
-        elif backend_wrong:
-            info(f"Server is running [bold]{model}[/] on the wrong backend for it "
-                 f"(needs {backend_name(model)}) — restarting onto the right one.")
-        else:
-            warn("Server process exists but isn't answering — restarting it.")
-        cmd_down(args)
+        if not force_restart and not changed and state.get("phase") != "ready":
+            info("Recovering a server whose startup was already in progress…")
+            ready = _wait_until_ready(
+                state["host"], state["port"], state["backend"], state["model"],
+                time.monotonic() + timeout, lambda: _state_is_owned(state),
+            )
+            if ready:
+                state["phase"] = "ready"
+                _atomic_write_json(STATE_FILE, state)
+                ok(f"MLX server is UP and HEALTHY 🟢  →  {_local_url(host, port, '')}")
+                return True
+            err(f"Existing startup did not become ready within {timeout}s; stopping it.")
+            _stop_locked()
+            return False
+        warn("Restarting the owned server to restore the requested healthy state.")
+        _stop_locked()
+    elif state:
+        warn("Discarding stale server state; its process identity no longer matches.")
+        _remove_state(state.get("instance"))
 
-    if not confirm_download(model, args.yes):
-        warn("Not starting server.")
+    if _port_in_use(host, port):
+        err(f"Port {port} is already in use by a process mlx-pi does not own.")
+        info("Stop that service or choose another --port; mlx-pi will not signal it.")
         return False
 
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    trim_log()
+    STATE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(STATE_DIR, 0o700)
+    trim_log(log_limit)
     bin_path = server_bin(model)
     kind = "vision (mlx_vlm.server)" if is_vision_model(model) else "text (mlx_lm.server)"
     info("Starting MLX server (background daemon)…")
@@ -903,61 +1262,102 @@ def cmd_up(args) -> bool:
 
     # Launch detached: start_new_session puts it in its own process group so it
     # survives this CLI exiting; output is appended to the log file.
-    logf = open(LOG_FILE, "a")
-    proc = subprocess.Popen(
-        [bin_path, "--model", model, "--host", host,
-         "--port", str(port), "--max-tokens", str(DEFAULT_MAX_TOKENS)],
-        stdout=logf, stderr=subprocess.STDOUT, start_new_session=True,
-    )
-    PID_FILE.write_text(str(proc.pid))
+    command = [bin_path, "--model", model, "--host", host,
+               "--port", str(port), "--max-tokens", str(DEFAULT_MAX_TOKENS)]
+    with open(LOG_FILE, "a") as logf:
+        proc = subprocess.Popen(command, stdout=logf, stderr=subprocess.STDOUT,
+                                start_new_session=True)
+    identity = None
+    for _ in range(10):
+        identity = _process_identity(proc.pid)
+        if identity or proc.poll() is not None:
+            break
+        time.sleep(0.05)
+    if not identity or identity["pgid"] != proc.pid:
+        _terminate_spawn(proc)
+        err("Could not verify the new server process identity; it was stopped safely.")
+        return False
+    state = {
+        "version": 1, "instance": str(uuid.uuid4()), "phase": "starting",
+        "pid": proc.pid, **identity, "backend": expected_backend, "model": model,
+        "host": host, "port": port,
+    }
+    try:
+        _atomic_write_json(STATE_FILE, state)
+    except BaseException:
+        _terminate_spawn(proc)
+        raise
     info(f"PID {proc.pid} — waiting for it to become healthy…")
 
-    # Poll health on a real clock (is_healthy can block up to its timeout, so a
-    # plain loop counter would drift). First run may download the model, so wait
-    # generously (override with MLX_STARTUP_TIMEOUT seconds).
-    timeout = int(os.environ.get("MLX_STARTUP_TIMEOUT", 600))
-    start = time.monotonic()
-    while time.monotonic() - start < timeout:
-        if proc.poll() is not None:
-            err("Server process died during startup. Last log lines:")
-            _tail(LOG_FILE, 20)
-            return False
-        if is_healthy(host, port):
+    # First run may download the model, so wait generously. LM uses cheap health
+    # polling followed by one completion request; timed-out requests are not
+    # retried because mlx-lm may continue processing them after the client leaves.
+    try:
+        ready = _wait_until_ready(
+            host, port, expected_backend, model, time.monotonic() + timeout,
+            lambda: proc.poll() is None,
+        )
+        if ready:
+            state["phase"] = "ready"
+            _atomic_write_json(STATE_FILE, state)
             console.print()
-            ok(f"MLX server is UP and HEALTHY 🟢  →  http://{host}:{port}")
+            ok(f"MLX server is UP and HEALTHY 🟢  →  {_local_url(host, port, '')}")
             return True
-        console.print(f"  [dim]…still warming up ({int(time.monotonic() - start)}s)[/]", end="\r")
-        time.sleep(1)
-    err(f"Server did not become healthy within {timeout}s. Check: ./mlx-pi logs")
+    except BaseException:
+        _terminate_owned(state, proc)
+        raise
+    reason = "exited during startup" if proc.poll() is not None else f"was not ready within {timeout}s"
+    err(f"Server {reason}; stopping it. Last log lines:")
+    _tail(LOG_FILE, 20)
+    _terminate_owned(state, proc)
     return False
 
-def cmd_down(args) -> None:
-    pid = server_pid()
-    if not pid:
-        info("No running server tracked. (Already off 🔴)")
-        PID_FILE.unlink(missing_ok=True)
-        return
-    info(f"Stopping MLX server (PID {pid})…")
+def cmd_up(args) -> bool:
+    requested_model = resolve_model(args)
+    if not _network_bind_allowed(args):
+        return False
     try:
-        os.kill(pid, signal.SIGTERM)
-    except OSError:
-        pass
-    for _ in range(10):
-        if server_pid() is None:
-            break
-        time.sleep(1)
-    if server_pid() is not None:
-        warn("Graceful stop timed out — force killing.")
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except OSError:
-            pass
-    PID_FILE.unlink(missing_ok=True)
-    ok("MLX server stopped 🔴")
+        with _file_lock(CONTROL_LOCK_FILE, blocking=False):
+            state = _read_server_state()
+            model = (state["model"] if not _model_requested(args) and _state_is_owned(state)
+                     else requested_model)
+            # Preserve a healthy non-default server on bare `up` without
+            # prompting for or requiring the implicit default model.
+            if (state and _state_is_owned(state) and not _model_requested(args)
+                    and state["host"] == args.host and state["port"] == args.port
+                    and is_healthy(state["host"], state["port"])):
+                return _start_locked(args, model)
+            require_backend(model)
+            if not confirm_download(model, args.yes):
+                warn("Not starting server.")
+                return False
+            return _start_locked(args, model)
+    except RuntimeError as exc:
+        err(str(exc))
+        return False
+
+def cmd_down(args) -> None:
+    try:
+        with _file_lock(CONTROL_LOCK_FILE, blocking=False):
+            _stop_locked()
+    except RuntimeError as exc:
+        err(str(exc))
 
 def cmd_restart(args) -> None:
-    cmd_down(args)
-    cmd_up(args)
+    requested_model = resolve_model(args)
+    if not _network_bind_allowed(args):
+        return
+    try:
+        with _file_lock(CONTROL_LOCK_FILE, blocking=False):
+            state = _read_server_state()
+            model = (state["model"] if not _model_requested(args) and _state_is_owned(state)
+                     else requested_model)
+            require_backend(model)
+            if not confirm_download(model, args.yes):
+                return
+            _start_locked(args, model, force_restart=True)
+    except RuntimeError as exc:
+        err(str(exc))
 
 def cmd_use(args) -> None:
     """Switch the served model AND pi's default together — the one command that
@@ -982,8 +1382,14 @@ def cmd_use(args) -> None:
 
     # 2. Restart the server on this model.
     step(f"Switching the served model to {model}")
-    cmd_down(args)
-    if not cmd_up(args):
+    if not _network_bind_allowed(args):
+        return
+    try:
+        with _file_lock(CONTROL_LOCK_FILE, blocking=False):
+            if not _start_locked(args, model, force_restart=True):
+                return
+    except RuntimeError as exc:
+        err(str(exc))
         return
 
     # 3. Point pi's default at the same model (pinned → only it).
@@ -991,16 +1397,20 @@ def cmd_use(args) -> None:
     if n is not None:
         tag = "  [dim](pinned)[/]" if _pin_enabled() else ""
         ok(f"Server and pi are now both on [bold]{model}[/] — pi sees {n} model(s).{tag}")
-    info("Restart pi (or use /model inside it) to pick up the change.")
+    info("Open /model inside pi to pick up the change.")
 
 def cmd_status(args) -> None:
-    host, port = args.host, args.port
+    requested_host, requested_port = args.host, args.port
     t = Table(show_header=False, box=None, pad_edge=False)
     t.add_column(style="bold cyan")
     t.add_column()
-    pid = server_pid()
-    healthy = is_healthy(host, port)
-    t.add_row("endpoint", f"http://{host}:{port}")
+    state = _read_server_state()
+    owned = _state_is_owned(state)
+    pid = state.get("pid") if owned else None
+    host = state["host"] if owned else requested_host
+    port = state["port"] if owned else requested_port
+    healthy = is_healthy(host, port) if owned else is_healthy(requested_host, requested_port)
+    t.add_row("endpoint", _local_url(host, port, ""))
     t.add_row("process", f"[green]running[/] (PID {pid})" if pid else "[red]not running[/]")
     t.add_row("health", "[green]healthy 🟢[/]" if healthy else "[red]not responding 🔴[/]")
     served = served_model(pid) if pid else None
@@ -1013,7 +1423,7 @@ def cmd_status(args) -> None:
         t.add_row("backend", label)
     pi_default = configured_model_id()
     if pi_default:
-        t.add_row("pi default model", pi_default)
+        t.add_row("pi global default", pi_default)
     if _pin_enabled():
         t.add_row("pin mode", "[green]on[/] — pi sees only the served model")
     t.add_row("log", str(LOG_FILE))
@@ -1023,19 +1433,25 @@ def cmd_status(args) -> None:
     if healthy and not pid:
         warn(f"Something is answering on port {port}, but mlx-pi isn't tracking "
              "a server it started — another process may be using this port.")
+    elif state and not owned:
+        warn("The saved server identity is stale; mlx-pi will not signal that PID.")
     elif pid and not healthy:
         info("Process is up but not answering yet — likely still loading/downloading "
              "the model (watch './mlx-pi logs').")
-    # Sync check: pi requests a model by name and the server hot-swaps to it,
-    # so the launched (preloaded) model is only a default. We can't observe the
-    # currently-resident model (the server doesn't expose or log it), but we CAN
-    # flag when pi's default differs from what was preloaded — that first request
-    # will force a reload (slower, more RAM).
+    # Sync check: same-backend choices can reload on demand. The state records
+    # the launch model; status intentionally uses cheap liveness rather than a
+    # generation probe or treating a legitimate VLM hot-swap as unhealthy.
     if served and pi_default and served != pi_default:
-        warn(f"pi defaults to [bold]{pi_default}[/], but the server preloaded "
-             f"[bold]{served}[/]. pi's first request will make the server reload "
-             f"(slower, more RAM). Align both with [bold]mlx-pi use {pi_default}[/], "
-             f"or just pick the served model inside pi.")
+        if backend_kind(served) != backend_kind(pi_default):
+            warn(f"pi's global default [bold]{pi_default}[/] uses a different backend "
+                 f"from the active [bold]{served}[/] server. They cannot hot-swap; "
+                 f"align them with [bold]mlx-pi use {pi_default}[/] or "
+                 f"[bold]mlx-pi pi --model {served}[/].")
+        else:
+            warn(f"pi defaults to [bold]{pi_default}[/], but the server preloaded "
+                 f"[bold]{served}[/]. pi's first request will reload it "
+                 f"(slower, more RAM). Align both with [bold]mlx-pi use {pi_default}[/], "
+                 f"or pick the served model inside pi.")
     elif served and len(configured_model_ids()) > 1:
         console.print("  [dim]Note: pi can pick any registered model; the server "
                       "hot-swaps per request, so choosing a non-preloaded model "
@@ -1053,6 +1469,8 @@ def cmd_run(args) -> None:
     """Foreground server (blocks). Good for debugging."""
     model = resolve_model(args)
     require_backend(model)
+    if not _network_bind_allowed(args):
+        return
     if not confirm_download(model, args.yes):
         warn("Not starting server.")
         return
@@ -1070,13 +1488,21 @@ def cmd_pi(args) -> None:
     # Ordering guarantee: bring the engine up (idempotent) BEFORE pi starts.
     if not cmd_up(args):
         return
-    # If a model was explicitly requested (e.g. `pi --gemma`), make it pi's
-    # default too, so pi opens on the same model the server now serves.
+    # An explicit model always becomes pi's default. On a bare invocation, also
+    # repair a cross-backend default: that mismatch cannot hot-swap safely.
     if _model_requested(args):
         model = resolve_model(args)
         if configured_model_id() != model:
             align_pi_default(model, args.port)
             info(f"pi will open on [bold]{model}[/].")
+    else:
+        state = _read_server_state()
+        pi_default = configured_model_id()
+        if (_state_is_owned(state)
+                and (not pi_default or backend_kind(pi_default) != state["backend"])):
+            align_pi_default(state["model"], state["port"])
+            info(f"Aligned pi with the active {state['backend']} backend: "
+                 f"[bold]{state['model']}[/].")
     console.print()
     info("Launching pi. Inside pi: [bold]/model[/] → switch between your "
          "[bold]local-mlx[/] models.")
@@ -1169,7 +1595,7 @@ def _pull_done(model: str, verb: str) -> None:
     ok(msg)
     n = refresh_pi_models()  # keeps pi's default; adds the now-complete model
     if n is not None:
-        info(f"pi now sees [bold]{n}[/] model(s) — restart pi (or /model) to pick it up.")
+        info(f"pi now sees [bold]{n}[/] model(s) — open /model to pick it up.")
 
 def cmd_models_pull(args) -> None:
     model = resolve_target_model(args)
@@ -1202,7 +1628,11 @@ def cmd_models_rm(args) -> None:
             f"  [yellow]❓ Delete {model} ({_size(size)}) from the cache?[/]", default=False):
         warn("Cancelled.")
         return
-    shutil.rmtree(base, ignore_errors=True)
+    try:
+        shutil.rmtree(base)
+    except OSError as exc:
+        err(f"Could not remove {model}: {exc}")
+        return
     ok(f"Removed {model} — freed ~{_size(size)}.")
     n = refresh_pi_models()  # drop it from pi's list too
     if n is not None:
@@ -1219,7 +1649,7 @@ def cmd_models_sync(args) -> None:
     for i, m in enumerate(ids):
         tag = "  [dim](default)[/]" if i == 0 else ""
         console.print(f"    [cyan]{m}[/]{tag}")
-    info("Restart pi (or use /model inside it) to pick up the change.")
+    info("Open /model inside pi to pick up the change.")
 
 def cmd_models_clean(args) -> None:
     """Sweep stale *.incomplete temp files across every cached model. Safe:
@@ -1253,80 +1683,40 @@ def cmd_models_doctor(args) -> None:
 #  SUBCOMMAND: plist  (generate, do NOT install)
 # ============================================================================
 
-PLIST_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
-<!--
-  com.mlx-pi.server.plist — generated by `mlx-pi plist`.
-  This file is NOT installed. To enable auto-start at login:
-      cp com.mlx-pi.server.plist ~/Library/LaunchAgents/
-      launchctl load   ~/Library/LaunchAgents/com.mlx-pi.server.plist   # enable
-      launchctl unload ~/Library/LaunchAgents/com.mlx-pi.server.plist   # disable
-  Edit --model / --port below if you want different values. NOTE: the binary
-  above is backend-specific — mlx_vlm.server for vision models, mlx_lm.server
-  for text. If you change --model to a different backend, regenerate this file
-  with `mlx-pi plist --model <id>` so the binary matches.
--->
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.mlx-pi.server</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>{server_bin}</string>
-        <string>--model</string>
-        <string>{model}</string>
-        <string>--host</string>
-        <string>{host}</string>
-        <string>--port</string>
-        <string>{port}</string>
-    </array>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>PATH</key>
-        <string>{home}/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
-        <key>HF_HUB_CACHE</key>
-        <string>{hf_cache}</string>{hf_token_entry}
-    </dict>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>StandardOutPath</key>
-    <string>{state}/launchd.out.log</string>
-    <key>StandardErrorPath</key>
-    <string>{state}/launchd.err.log</string>
-    <key>Nice</key>
-    <integer>5</integer>
-</dict>
-</plist>
-"""
-
 def cmd_plist(args) -> None:
-    from xml.sax.saxutils import escape
     model = resolve_model(args)
-    out = Path(args.output)
+    if not _network_bind_allowed(args):
+        return
+    out = Path(args.output).expanduser()
+    if out.is_symlink():
+        err(f"Refusing to replace symlink output: {out}")
+        return
+    STATE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(STATE_DIR, 0o700)
 
     # launchd runs with a minimal env, so a gated/throttled download would fail
     # there. If HF_TOKEN is set now, bake it in (plaintext) so the auto-start
     # server can authenticate. Skipped (and noted) when no token is present.
     token = os.environ.get("HF_TOKEN")
-    hf_token_entry = (
-        f"\n        <key>HF_TOKEN</key>\n        <string>{escape(token)}</string>"
-        if token else ""
-    )
-
-    content = PLIST_TEMPLATE.format(
-        server_bin=server_bin(model),
-        model=model,
-        host=args.host,
-        port=args.port,
-        home=str(Path.home()),
-        hf_cache=str(HF_CACHE),
-        state=str(STATE_DIR),
-        hf_token_entry=hf_token_entry,
-    )
-    out.write_text(content)
+    environment = {
+        "PATH": f"{Path.home()}/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "HF_HUB_CACHE": str(HF_CACHE),
+    }
+    if token:
+        environment["HF_TOKEN"] = token
+    data = {
+        "Label": "com.mlx-pi.server",
+        "ProgramArguments": [server_bin(model), "--model", model,
+                             "--host", args.host, "--port", str(args.port),
+                             "--max-tokens", str(DEFAULT_MAX_TOKENS)],
+        "EnvironmentVariables": environment,
+        "RunAtLoad": True,
+        "KeepAlive": True,
+        "StandardOutPath": str(STATE_DIR / "launchd.out.log"),
+        "StandardErrorPath": str(STATE_DIR / "launchd.err.log"),
+        "Nice": 5,
+    }
+    _atomic_write(out, plistlib.dumps(data, fmt=plistlib.FMT_XML))
     ok(f"Wrote personalized launchd plist → {out}")
     if token:
         warn("Baked your HF_TOKEN into the plist (plaintext) so the launchd "
@@ -1338,8 +1728,9 @@ def cmd_plist(args) -> None:
              "'mlx-pi plist' to include it, or pre-download with 'mlx-pi models pull'.")
     info("It is NOT installed. To enable auto-start at login:")
     console.print(f"  [cyan]cp {out} ~/Library/LaunchAgents/[/]")
-    console.print(f"  [cyan]launchctl load ~/Library/LaunchAgents/{out.name}[/]")
-    console.print(f"  [dim]Disable later: launchctl unload ~/Library/LaunchAgents/{out.name}[/]")
+    console.print(f"  [cyan]launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/{out.name}[/]")
+    console.print(f"  [dim]Disable later: launchctl bootout gui/$(id -u) "
+                  f"~/Library/LaunchAgents/{out.name}[/]")
     warn("A launchd server is always-on and holds the model in RAM from login. "
          "On a laptop you may prefer manual ./mlx-pi up / down.")
 
@@ -1404,6 +1795,10 @@ def cmd_uninstall(args) -> None:
             warn(f"Nothing to remove at {link}.")
         return
     target = link.resolve()
+    current = Path(__file__).resolve()
+    if target != current:
+        err(f"{link} points to {target}, not this mlx-pi installation — leaving it alone.")
+        return
     link.unlink()
     ok(f"Removed symlink {link} (was → {target}).")
 
@@ -1447,7 +1842,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     def server_opts(sp):
         sp.add_argument("--host", default=DEFAULT_HOST, help=f"bind address (default {DEFAULT_HOST})")
-        sp.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"port (default {DEFAULT_PORT})")
+        sp.add_argument("--port", type=_port, default=DEFAULT_PORT, help=f"port (default {DEFAULT_PORT})")
+        sp.add_argument("--allow-network", action="store_true",
+                        help="allow a non-loopback bind (the API is unauthenticated)")
         sp.add_argument("-y", "--yes", action="store_true", help="skip the download-size prompt")
 
     sp = sub.add_parser("setup", help="install mlx-lm + mlx-vlm + pi and configure everything")
@@ -1582,6 +1979,11 @@ def main() -> None:
     if not getattr(args, "func", None):
         print_overview()
         return
+    if (getattr(args, "repo", None)
+            and (getattr(args, "model", None) or getattr(args, "qwen_coder", False)
+                 or getattr(args, "gemma", False))):
+        err("Use either positional REPO_ID or a model selector flag, not both.")
+        sys.exit(2)
     try:
         args.func(args)
     except KeyboardInterrupt:
